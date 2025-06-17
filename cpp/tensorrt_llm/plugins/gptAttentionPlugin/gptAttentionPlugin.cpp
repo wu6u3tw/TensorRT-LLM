@@ -207,7 +207,6 @@ void GPTAttentionPlugin::initEntryIdx()
     for (size_t i = 0; i < static_cast<size_t>(IdxEntry::ENUM_SIZE); i++)
     {
         mEntryIdx[i] = entryIdx;
-        TLLM_LOG_DEBUG("i: %d entryIdx: %d  ", i, entryIdx, toString(static_cast<IdxEntry>(i)).data());
         entryIdx += isEntryUsed(static_cast<IdxEntry>(i));
     }
 }
@@ -404,12 +403,7 @@ bool GPTAttentionPlugin::supportsFormatCombination(
     {
         posCaseLine = __LINE__;
         result = inOut[pos].type == nvinfer1::DataType::kFLOAT && inOut[pos].format == TensorFormat::kLINEAR;
-    }/*
-    else if (getSMVersion() >= 100 && isCrossAttention() && mMaskType == AttentionMaskType::CAUSAL && pos == getIdx(IdxEntry::ATTENTION_MASK))
-    {
-        posCaseLine = __LINE__;
-        result = inOut[pos].type == nvinfer1::DataType::kBOOL && inOut[pos].format == TensorFormat::kLINEAR;
-    }*/ 
+    }
     else if (useFullCustomMask() && pos == getIdx(IdxEntry::ATTENTION_MASK))
     {
         posCaseLine = __LINE__;
@@ -427,14 +421,6 @@ bool GPTAttentionPlugin::supportsFormatCombination(
         posCaseLine = __LINE__;
         result = inOut[pos].type == nvinfer1::DataType::kINT32 && inOut[pos].format == TensorFormat::kLINEAR;
     }
-    /*
-    else if (useKVCache() && mPagedKVCache && (pos == getIdx(IdxEntry::HOST_KV_CACHE_POOL_POINTERS)) && getSMVersion() >= 100 && isCrossAttention())
-    {
-        // kv cache pool pointers
-        posCaseLine = __LINE__;
-        result = inOut[pos].type == nvinfer1::DataType::kINT32 && inOut[pos].format == TensorFormat::kLINEAR;
-    }
-*/
     else if (useKVCache() && mPagedKVCache && (pos == getIdx(IdxEntry::HOST_KV_CACHE_POOL_POINTERS)))
     {
         // kv cache pool pointers
@@ -507,8 +493,6 @@ bool GPTAttentionPlugin::supportsFormatCombination(
     }
     TLLM_LOG_DEBUG(
         "%s: pos: %d, result: %d, posCaseLine: %d inOut[pos].type %s", __PRETTY_FUNCTION__, pos, static_cast<int>(result), posCaseLine, trt_datatype_2_string(inOut[pos].type).c_str());
-    TLLM_LOG_DEBUG("%s: useKVCache:%b isCrossAttention:%b", __PRETTY_FUNCTION__, useKVCache(), isCrossAttention());
-//    result = true;
     return result;
 }
 
