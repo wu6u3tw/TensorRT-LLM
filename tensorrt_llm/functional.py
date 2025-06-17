@@ -2711,6 +2711,7 @@ def _lookup_plugin(input: Tensor, weight: Tensor, rank: int,
         plug_inputs.append(per_token_scale.trt_tensor)
         weight.trt_tensor.set_dynamic_range(-127, 127)
     layer = default_trtnet().add_plugin_v2(plug_inputs, lookup_plug)
+
     _add_plugin_info(layer, plg_creator, "lookup", pfc)
     return _create_tensor(layer.get_output(0), layer)
 
@@ -4623,6 +4624,7 @@ def bert_attention(tensor: Tensor,
 
     plug_inputs = [i.trt_tensor for i in plug_inputs]
 
+
     layer = default_trtnet().add_plugin_v2(plug_inputs, attn_plug)
     _add_plugin_info(layer, attn_plg_creator, "padding_attn", pfc)
     assert layer.num_outputs == 1, \
@@ -5775,10 +5777,10 @@ def gpt_attention(
     if attention_mask is not None and mask_type == AttentionMaskType.custom_mask:
         # useFullCustomMask
         plug_inputs += [attention_mask]
-    if attention_mask is not None and mask_type == AttentionMaskType.causal and get_sm_version() >= 100: # and model_type != "whisper":
-        plug_inputs += [attention_mask]
+    #if attention_mask is not None and mask_type == AttentionMaskType.causal and get_sm_version() >= 100: # and model_type != "whisper":
+    #    plug_inputs += [attention_mask]
 
-    if attention_packed_mask is not None:
+    if attention_packed_mask is not None and get_sm_version() < 100:
         # usePackedCustomMask
         plug_inputs += [attention_packed_mask]
     if use_cache:
@@ -5884,7 +5886,14 @@ def gpt_attention(
     for idx, i in enumerate(plug_inputs):
         assert i is not None, f"Found None input for {idx} th item in plugin inputs {plug_inputs}"
 
+    print("======================= attention op plug_inputs =================== " )
+    for idx, i in enumerate(plug_inputs):
+        print(f"idx: {idx}  i: {i}")
+
+
     plug_inputs = [i.trt_tensor for i in plug_inputs]
+
+
     layer = default_trtnet().add_plugin_v2(plug_inputs, attn_plug)
     _add_plugin_info(layer, attn_plg_creator, "causal_attn", pfc)
     output = _create_tensor(layer.get_output(0), layer)
@@ -6678,7 +6687,6 @@ def lora_plugin(
         plug_inputs += [host_context_lengths]
 
     plug_inputs = [i.trt_tensor for i in plug_inputs]
-    print(plug_inputs)
     layer = default_trtnet().add_plugin_v2(plug_inputs, lora_plug)
 
     if num_lora_modules == 1:
