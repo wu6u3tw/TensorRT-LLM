@@ -154,7 +154,7 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::QKV_TENSOR: return true;
     case IdxEntry::K_TENSOR: return mUnfuseQkvGemm;
     case IdxEntry::V_TENSOR: return mUnfuseQkvGemm;
-    case IdxEntry::ATTENTION_MASK: return (isCrossAttention() && getSMVersion() >= 100 && mMaskType == AttentionMaskType::CAUSAL) ||  useFullCustomMask();
+    case IdxEntry::ATTENTION_MASK: return /*(isCrossAttention() && getSMVersion() >= 100 && mMaskType == AttentionMaskType::CAUSAL) || */ useFullCustomMask();
     case IdxEntry::ATTENTION_PACKED_MASK: return useCustomMask();
     case IdxEntry::SEQUENCE_LENGTH: return useKVCache();
     case IdxEntry::HOST_PAST_KEY_VALUE_LENGTHS: return useKVCache();
@@ -499,7 +499,7 @@ bool GPTAttentionPlugin::supportsFormatCombination(
     TLLM_LOG_DEBUG(
         "%s: pos: %d, result: %d, posCaseLine: %d inOut[pos].type %s", __PRETTY_FUNCTION__, pos, static_cast<int>(result), posCaseLine, trt_datatype_2_string(inOut[pos].type).c_str());
     TLLM_LOG_DEBUG("%s: useKVCache:%b isCrossAttention:%b", __PRETTY_FUNCTION__, useKVCache(), isCrossAttention());
-    result = true;
+    //result = true;
     return result;
 }
 
