@@ -154,7 +154,7 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::QKV_TENSOR: return true;
     case IdxEntry::K_TENSOR: return mUnfuseQkvGemm;
     case IdxEntry::V_TENSOR: return mUnfuseQkvGemm;
-    case IdxEntry::ATTENTION_MASK: return useFullCustomMask();
+    case IdxEntry::ATTENTION_MASK: return (isCrossAttention() && getSMVersion() >= 100 && mMaskType == AttentionMaskType::CAUSAL) ||  useFullCustomMask();
     case IdxEntry::ATTENTION_PACKED_MASK: return useCustomMask();
     case IdxEntry::SEQUENCE_LENGTH: return useKVCache();
     case IdxEntry::HOST_PAST_KEY_VALUE_LENGTHS: return useKVCache();
@@ -207,6 +207,7 @@ void GPTAttentionPlugin::initEntryIdx()
     for (size_t i = 0; i < static_cast<size_t>(IdxEntry::ENUM_SIZE); i++)
     {
         mEntryIdx[i] = entryIdx;
+        TLLM_LOG_DEBUG("i: %d entryIdx: %d  ", i, entryIdx, toString(static_cast<IdxEntry>(i)).data());
         entryIdx += isEntryUsed(static_cast<IdxEntry>(i));
     }
 }
@@ -318,6 +319,26 @@ nvinfer1::DimsExprs GPTAttentionPlugin::getOutputDimensions(
     return inputs[getIdx(IdxEntry::PAST_KEY_VALUE)];
 }
 
+inline std::string trt_datatype_2_string(nvinfer1::DataType d) {
+  switch(d){
+    case nvinfer1::DataType::kINT32:
+      return "nvinfer1::DataType::kINT32";
+    case nvinfer1::DataType::kFLOAT:  
+      return "nvinfer1::DataType::kFLOAT";
+    case nvinfer1::DataType::kINT64:
+      return "nvinfer1::DataType::kINT64";
+    case nvinfer1::DataType::kBOOL:
+      return "nvinfer1::DataType::kBOOL";
+    case nvinfer1::DataType::kINT8:
+      return "nvinfer1::DataType::kINT8";
+    case nvinfer1::DataType::kFP8:
+      return "nvinfer1::DataType::kFP8";
+    default:
+     break; 
+  }
+  return "none";
+}
+
 bool GPTAttentionPlugin::supportsFormatCombination(
     int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
@@ -384,6 +405,11 @@ bool GPTAttentionPlugin::supportsFormatCombination(
         posCaseLine = __LINE__;
         result = inOut[pos].type == nvinfer1::DataType::kFLOAT && inOut[pos].format == TensorFormat::kLINEAR;
     }
+    else if (getSMVersion() >= 100 && isCrossAttention() && mMaskType == AttentionMaskType::CAUSAL && pos == getIdx(IdxEntry::ATTENTION_MASK))
+    {
+        posCaseLine = __LINE__;
+        result = inOut[pos].type == nvinfer1::DataType::kBOOL && inOut[pos].format == TensorFormat::kLINEAR;
+    } 
     else if (useFullCustomMask() && pos == getIdx(IdxEntry::ATTENTION_MASK))
     {
         posCaseLine = __LINE__;
@@ -405,7 +431,7 @@ bool GPTAttentionPlugin::supportsFormatCombination(
     {
         // kv cache pool pointers
         posCaseLine = __LINE__;
-        result = inOut[pos].type == nvinfer1::DataType::kINT64 && inOut[pos].format == TensorFormat::kLINEAR;
+        result = inOut[pos].type == nvinfer1::DataType::kINT64  && inOut[pos].format == TensorFormat::kLINEAR;
     }
     else if (useKVCache() && mPagedKVCache && (pos == getIdx(IdxEntry::HOST_KV_CACHE_POOL_MAPPING)))
     {
@@ -471,7 +497,9 @@ bool GPTAttentionPlugin::supportsFormatCombination(
         result = (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
     }
     TLLM_LOG_DEBUG(
-        "%s: pos: %d, result: %d, posCaseLine: %d", __PRETTY_FUNCTION__, pos, static_cast<int>(result), posCaseLine);
+        "%s: pos: %d, result: %d, posCaseLine: %d inOut[pos].type %s", __PRETTY_FUNCTION__, pos, static_cast<int>(result), posCaseLine, trt_datatype_2_string(inOut[pos].type).c_str());
+    TLLM_LOG_DEBUG("%s: useKVCache:%b isCrossAttention:%b", __PRETTY_FUNCTION__, useKVCache(), isCrossAttention());
+    result = true;
     return result;
 }
 

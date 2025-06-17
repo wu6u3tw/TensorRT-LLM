@@ -1708,9 +1708,26 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         {
             fmhaParams.chunkedAttentionSize = *mAttentionChunkSize;
         }
+/*
+        Data_type data_type;
 
+        if (mType == nvinfer1::DataType::kHALF)
+        {
+            data_type = DATA_TYPE_FP16;
+        } else {
+            data_type = DATA_TYPE_FP32;
+        }
+
+
+        fmhaParams.dataTypeOut = data_type;
+        fmhaParams.dataType = data_type;
+*/
         // Run the fmha kernel.
         mFmhaDispatcher->run(fmhaParams);
+
+        std::cout<<"line 1715: mFmhaDispatcher->isSupported()"<<mFmhaDispatcher->isSupported()<<std::endl;
+
+
         sync_check_cuda_error(stream);
         // The kv cache might need to be updated after FMHA (only when sliding window attention + chunked context is
         // used together). Reuse the preprocessingParams.
@@ -2552,8 +2569,12 @@ int AttentionOp::initialize() noexcept
         fmhaParams.hasAlibi = isALiBi();
         fmhaParams.scaleAlibi = isAliBiWithScale();
 
+        fmhaParams.dataTypeOut = data_type;
+
         // Load kernels from the pre-compiled cubins.
         mFmhaDispatcher.reset(new FmhaDispatcher(fmhaParams));
+
+        std::cout<<"line 2560: mFmhaDispatcher->isSupported() "<<mFmhaDispatcher->isSupported()<<std::endl;
 
         // Deepseek-V2 Generation needs a differ fmha with different argumments
         if (mIsMLAEnabled)

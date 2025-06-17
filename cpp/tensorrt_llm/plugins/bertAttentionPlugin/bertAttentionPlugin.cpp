@@ -520,7 +520,14 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 cudaMemsetAsync(fmhaParams.outputPtr, 0, ring_block_output_size, stream);
                 cudaMemcpyAsync(fmhaParams.tileCounterPtr, fmha_scheduler_counter_h, sizeof(uint32_t),
                     cudaMemcpyHostToDevice, stream);
-                mFMHARunner->run(fmhaParams);
+
+                if(tensorrt_llm::common::getSMVersion() == 100){                  
+                  std::cout<<"bertattention line::525 mFmhaDispatcher-> isSupported: "<< mFmhaDispatcher->isSupported()<<std::endl;
+                  mFmhaDispatcher->run(fmhaParams);
+                }
+                else{
+                  mFMHARunner->run(fmhaParams);
+                }
                 if (iter != 0)
                 {
                     invokeRecoverFromRA<T>((T*) context_buf_, (float*) ring_softmax_accu_stats_buf_,
@@ -675,12 +682,14 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 sync_check_cuda_error(stream);
             }
 
+
             // Construct the fmha params for running kernels.
             MHARunnerParams fmhaParams{};
             fmhaParams.b = request_batch_size;
             fmhaParams.qSeqLen = request_seq_len;
             fmhaParams.kvSeqLen = request_seq_len;
             fmhaParams.totalQSeqLen = request_batch_size * request_seq_len;
+
             // Device buffer pointers.
             fmhaParams.qkvPtr = attention_input;
             fmhaParams.outputPtr = context_buf_;
@@ -703,8 +712,50 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 fmhaParams.vMaxNBlock = (input_seq_len + mSageAttnVBlockSize - 1) / mSageAttnVBlockSize;
             }
 
-            // Run the fmha kernel.
-            mFMHARunner->run(fmhaParams);
+
+            if(tensorrt_llm::common::getSMVersion() == 100){
+
+                // TODO: set it correctly for contiguous kv buffer (cross-attention).
+                fmhaParams.totalKvSeqLen = num_tokens;
+
+/*
+                if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
+                {
+                    if (mIsMLAEnabled && mPagedContextFMHA && mPagedKVCache)
+                    {
+                        fmhaParams.pagedKvCache = mla_context_paged_kv_cache_buffer;
+                        fmhaParams.qPtr = reinterpret_cast<void const*>(attention_input);
+                    }
+                    else
+                    {
+                        fmhaParams.pagedKvCache = kv_cache_buffer;
+                    }
+                }
+*/
+
+                //fmhaParams.kvSeqLenPtr = input_seq_len;
+                fmhaParams.cuKvSeqLenPtr = cu_seqlens;
+                fmhaParams.cuMaskRowsPtr = cu_seqlens;
+                fmhaParams.tileCounterPtr = fmha_tile_counter_ptr;
+
+
+                fmhaParams.scaleBmm1Ptr = scale_bmm1_ptr;
+                fmhaParams.scaleBmm2Ptr = scale_bmm2_ptr;
+//                fmhaParams.oSfScalePtr = params.attention_output_sf_scale;
+                fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
+/*
+                if (mAttentionChunkSize)
+                {
+                    fmhaParams.chunkedAttentionSize = *mAttentionChunkSize;
+                }
+  */ 
+                mFmhaDispatcher->run(fmhaParams);
+   
+            } else{
+       
+                // Run the fmha kernel.
+                mFMHARunner->run(fmhaParams);
+            }
             sync_check_cuda_error(stream);
             if (mSageAttn)
             {
@@ -947,11 +998,26 @@ int BertAttentionPlugin::initialize() noexcept
             fmhaParams.saveSoftmax = true;
         }
 
-        // Load kernels from the pre-compiled cubins.
-        mFMHARunner.reset(new FusedMHARunnerV2(fmhaParams));
+        if(tensorrt_llm::common::getSMVersion() == 100){
+            // // The KV input data type. The default is same as dataType.
+            fmhaParams.dataTypeKv = data_type;
+            fmhaParams.forceFp32Acc = false;
+            //fmhaParams.numTokensPerBlock = mTokensPerBlock;
+            fmhaParams.headSizeV = mHeadSize;
 
-        // Fall back to unfused MHA kernels if not supported.
-        mEnableContextFMHA = mFMHARunner->isFmhaSupported();
+  
+            // Load kernels from the pre-compiled cubins for blackwell.         
+            mFmhaDispatcher.reset(new FmhaDispatcher(fmhaParams));
+            // Fall back to unfused MHA kernels if not supported for blackwell.
+            mEnableContextFMHA = mFmhaDispatcher->isSupported();
+        }
+        else{
+            // Load kernels from the pre-compiled cubins.
+            mFMHARunner.reset(new FusedMHARunnerV2(fmhaParams));
+            // Fall back to unfused MHA kernels if not supported.
+            mEnableContextFMHA = mFMHARunner->isFmhaSupported();
+
+        }
     }
 
 #if ENABLE_MULTI_DEVICE

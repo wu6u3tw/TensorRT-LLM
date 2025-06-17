@@ -814,7 +814,10 @@ bool FusedMHARunnerV2::isFmhaSupported()
     {
         std::string msg = "FMHA Kernel doesn't exist for mFixedParams:\n" + mFixedParams.convertToStrOutput();
         TLLM_LOG_WARNING("%s\n", msg.c_str());
+    } else{
+        TLLM_LOG_DEBUG("./tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmhaRunner.cpp::818 FusedMHARunnerV2::isFmhaSupported: true\n");
     }
+
     return is_supported;
 }
 
