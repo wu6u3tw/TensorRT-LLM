@@ -713,27 +713,11 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
             }
 
 
-            if(tensorrt_llm::common::getSMVersion() == 100){
+            if(tensorrt_llm::common::getSMVersion() >= 100){
 
                 // TODO: set it correctly for contiguous kv buffer (cross-attention).
                 fmhaParams.totalKvSeqLen = num_tokens;
 
-/*
-                if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
-                {
-                    if (mIsMLAEnabled && mPagedContextFMHA && mPagedKVCache)
-                    {
-                        fmhaParams.pagedKvCache = mla_context_paged_kv_cache_buffer;
-                        fmhaParams.qPtr = reinterpret_cast<void const*>(attention_input);
-                    }
-                    else
-                    {
-                        fmhaParams.pagedKvCache = kv_cache_buffer;
-                    }
-                }
-*/
-
-                //fmhaParams.kvSeqLenPtr = input_seq_len;
                 fmhaParams.cuKvSeqLenPtr = cu_seqlens;
                 fmhaParams.cuMaskRowsPtr = cu_seqlens;
                 fmhaParams.tileCounterPtr = fmha_tile_counter_ptr;
@@ -741,14 +725,7 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
 
                 fmhaParams.scaleBmm1Ptr = scale_bmm1_ptr;
                 fmhaParams.scaleBmm2Ptr = scale_bmm2_ptr;
-//                fmhaParams.oSfScalePtr = params.attention_output_sf_scale;
                 fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
-/*
-                if (mAttentionChunkSize)
-                {
-                    fmhaParams.chunkedAttentionSize = *mAttentionChunkSize;
-                }
-  */ 
                 mFmhaDispatcher->run(fmhaParams);
    
             } else{
@@ -998,11 +975,10 @@ int BertAttentionPlugin::initialize() noexcept
             fmhaParams.saveSoftmax = true;
         }
 
-        if(tensorrt_llm::common::getSMVersion() == 100){
+        if(tensorrt_llm::common::getSMVersion() >= 100){
             // // The KV input data type. The default is same as dataType.
             fmhaParams.dataTypeKv = data_type;
             fmhaParams.forceFp32Acc = false;
-            //fmhaParams.numTokensPerBlock = mTokensPerBlock;
             fmhaParams.headSizeV = mHeadSize;
 
   
