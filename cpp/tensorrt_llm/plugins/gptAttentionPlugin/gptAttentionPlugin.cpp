@@ -45,6 +45,26 @@ using tensorrt_llm::plugins::GPTAttentionPlugin;
 static char const* GPT_ATTENTION_PLUGIN_VERSION{"1"};
 static char const* GPT_ATTENTION_PLUGIN_NAME{"GPTAttention"};
 
+inline std::string datatype_to_string(nvinfer1::DataType d) {
+  switch(d){
+    case nvinfer1::DataType::kINT32:
+      return "nvinfer1::DataType::kINT32";
+    case nvinfer1::DataType::kFLOAT:  
+      return "nvinfer1::DataType::kFLOAT";
+    case nvinfer1::DataType::kINT64:
+      return "nvinfer1::DataType::kINT64";
+    case nvinfer1::DataType::kBOOL:
+      return "nvinfer1::DataType::kBOOL";
+    case nvinfer1::DataType::kINT8:
+      return "nvinfer1::DataType::kINT8";
+    case nvinfer1::DataType::kFP8:
+      return "nvinfer1::DataType::kFP8";
+    default:
+     break; 
+  }
+  return "none";
+}
+
 GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_start, int vision_length,
     int num_kv_heads, int num_kv_heads_origin, int head_size, int unidirectional, float q_scaling,
     float attn_logit_softcapping_scale, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
@@ -154,7 +174,7 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::QKV_TENSOR: return true;
     case IdxEntry::K_TENSOR: return mUnfuseQkvGemm;
     case IdxEntry::V_TENSOR: return mUnfuseQkvGemm;
-    case IdxEntry::ATTENTION_MASK: return /*(isCrossAttention() && getSMVersion() >= 100 && mMaskType == AttentionMaskType::CAUSAL) || */ useFullCustomMask();
+    case IdxEntry::ATTENTION_MASK: return useFullCustomMask();
     case IdxEntry::ATTENTION_PACKED_MASK: return useCustomMask();
     case IdxEntry::SEQUENCE_LENGTH: return useKVCache();
     case IdxEntry::HOST_PAST_KEY_VALUE_LENGTHS: return useKVCache();
@@ -318,25 +338,6 @@ nvinfer1::DimsExprs GPTAttentionPlugin::getOutputDimensions(
     return inputs[getIdx(IdxEntry::PAST_KEY_VALUE)];
 }
 
-inline std::string trt_datatype_2_string(nvinfer1::DataType d) {
-  switch(d){
-    case nvinfer1::DataType::kINT32:
-      return "nvinfer1::DataType::kINT32";
-    case nvinfer1::DataType::kFLOAT:  
-      return "nvinfer1::DataType::kFLOAT";
-    case nvinfer1::DataType::kINT64:
-      return "nvinfer1::DataType::kINT64";
-    case nvinfer1::DataType::kBOOL:
-      return "nvinfer1::DataType::kBOOL";
-    case nvinfer1::DataType::kINT8:
-      return "nvinfer1::DataType::kINT8";
-    case nvinfer1::DataType::kFP8:
-      return "nvinfer1::DataType::kFP8";
-    default:
-     break; 
-  }
-  return "none";
-}
 
 bool GPTAttentionPlugin::supportsFormatCombination(
     int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
@@ -492,7 +493,7 @@ bool GPTAttentionPlugin::supportsFormatCombination(
         result = (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
     }
     TLLM_LOG_DEBUG(
-        "%s: pos: %d, result: %d, posCaseLine: %d inOut[pos].type %s", __PRETTY_FUNCTION__, pos, static_cast<int>(result), posCaseLine, trt_datatype_2_string(inOut[pos].type).c_str());
+        "%s: pos: %d, result: %d, posCaseLine: %d inOut[pos].type: %s", __PRETTY_FUNCTION__, pos, static_cast<int>(result), posCaseLine, datatype_to_string(inOut[pos].type).c_str());
     return result;
 }
 

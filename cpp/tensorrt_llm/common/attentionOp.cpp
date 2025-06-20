@@ -1711,8 +1711,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         // Run the fmha kernel.
         mFmhaDispatcher->run(fmhaParams);
-
-
         sync_check_cuda_error(stream);
         // The kv cache might need to be updated after FMHA (only when sliding window attention + chunked context is
         // used together). Reuse the preprocessingParams.
@@ -2558,7 +2556,6 @@ int AttentionOp::initialize() noexcept
 
         // Load kernels from the pre-compiled cubins.
         mFmhaDispatcher.reset(new FmhaDispatcher(fmhaParams));
-
 
         // Deepseek-V2 Generation needs a differ fmha with different argumments
         if (mIsMLAEnabled)
