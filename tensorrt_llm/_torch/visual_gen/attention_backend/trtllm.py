@@ -179,6 +179,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         max_seq_len: int = 4096,
         sage_attention_config: Optional[SageAttentionConfig] = None,
         attention_metadata_state: Optional[dict] = None,
+        sparse_attention_config=None,
     ):
         num_kv_heads = num_kv_heads or num_heads
 
@@ -190,6 +191,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             quant_config=quant_config,
             dtype=dtype,
         )
+        # SkipSoftmax: BaseTrtllmAttention.forward() reads from this
+        self.sparse_attention_config = sparse_attention_config
 
         # TRTLLM expects flat [B*S, H*D] format
         self._preferred_layout = AttentionTensorLayout.NHD
@@ -259,7 +262,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             seq_len_kv: Sequence length for K/V (for cross-attention, defaults to seq_len)
 
         Returns:
-            Output tensor [B, S, H*D]
+            Output tensor [B, S_q, H*D]
         """
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)

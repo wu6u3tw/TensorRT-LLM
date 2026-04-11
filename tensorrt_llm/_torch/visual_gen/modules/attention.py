@@ -4,6 +4,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+from tensorrt_llm.logger import logger
+
 from ...modules.linear import Linear, WeightMode, WeightsLoadingConfig
 from ...modules.rms_norm import RMSNorm
 from ..attention_backend.interface import AttentionTensorLayout
@@ -80,7 +82,8 @@ class Attention(nn.Module):
         ulysses_size = vgm.ulysses_size if vgm else 1
         base_backend = config.attention.backend
 
-        # TRTLLM doesn't support cross-attention (different Q/KV seq lengths); fall back to VANILLA
+        # TRTLLM C++ requires fused QKV for non-MLA attention (attentionOp.cpp:640).
+        # Cross-attention has different Q/KV seq_len → can't fuse. Use VANILLA.
         if self.qkv_mode == QKVMode.SEPARATE_QKV and base_backend == "TRTLLM":
             backend_name = "VANILLA"
         else:
@@ -143,6 +146,46 @@ class Attention(nn.Module):
             backend_num_heads = self.num_attention_heads
             backend_num_kv_heads = self.num_key_value_heads
 
+        # Resolve sparse attention config for TRTLLM backend
+        sparse_attention_config = None
+        from ..config import SkipSoftmaxConfig
+
+        ss_cfg = config.attention.sparse_attention_config
+        if isinstance(ss_cfg, SkipSoftmaxConfig) and backend_name == "TRTLLM":
+            # SM90 (Hopper) does not support skip_softmax with full (non-causal)
+            # attention mask. Only SM100+ (Blackwell) is supported.
+            from tensorrt_llm._utils import get_sm_version
+
+            sm = get_sm_version()
+            if sm < 100:
+                logger.warning(
+                    "skip_softmax requires SM100+ (Blackwell). "
+                    f"Current GPU is SM{sm} — disabling skip_softmax."
+                )
+            else:
+                # Resolve target_sparsity → threshold_scale_factor if needed.
+                # Formula coefficients: user config > checkpoint config.json.
+                # ModelOpt checkpoint format:
+                #   sparse_attention_config.threshold_scale_factor.prefill: {a, b}
+                checkpoint_formula = None
+                hf_cfg = getattr(config, "hf_config", None)
+                if hf_cfg is not None:
+                    sparse_ckpt = getattr(hf_cfg, "sparse_attention_config", None)
+                    if isinstance(sparse_ckpt, dict):
+                        tsf = sparse_ckpt.get("threshold_scale_factor", {})
+                        checkpoint_formula = tsf.get("prefill")
+
+                threshold = ss_cfg.resolve_threshold_scale_factor(checkpoint_formula)
+
+                # Store resolved value back for layer_overrides to use
+                if threshold is not None and threshold > 0:
+                    ss_cfg.threshold_scale_factor = threshold
+                    from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+                    sparse_attention_config = SkipSoftmaxAttentionConfig(
+                        threshold_scale_factor={"prefill": threshold, "decode": 0}
+                    )
+
         # Create compute backend
         self.attn = create_attention(
             backend=backend_name,
@@ -154,6 +197,7 @@ class Attention(nn.Module):
             dtype=self.dtype,
             attention_config=config.attention,
             attention_metadata_state=attention_metadata_state,
+            sparse_attention_config=sparse_attention_config,
         )
 
         # Wrap with parallelism strategy (orthogonal to backend choice)

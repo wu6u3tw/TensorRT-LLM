@@ -1,4 +1,6 @@
+import fnmatch
 import json
+import math
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
@@ -79,12 +81,131 @@ class SageAttentionConfig(StrictBaseModel):
     qk_int8: bool = PydanticField(True, description="Use INT8 (vs E4M3) for Q/K quantization")
 
 
+class BaseSparseAttentionConfig(StrictBaseModel):
+    """Base class for sparse attention configurations.
+
+    Subclasses must set ``algorithm`` to a unique literal string.
+    The ``algorithm`` field acts as a Pydantic discriminator so that
+    users can write ``sparse_attention_config: {algorithm: skip_softmax, ...}``
+    and the correct subclass is instantiated automatically.
+    """
+
+    algorithm: str = PydanticField(description="Sparse attention algorithm name")
+    layer_overrides: Optional[Dict[str, float]] = PydanticField(
+        None,
+        description="Per-layer threshold/parameter overrides. Keys are fnmatch "
+        "patterns matched against module names. Set to 0 to disable for "
+        "matching layers. Example: {'transformer_blocks.0.*': 0}",
+    )
+
+    def resolve_threshold(self, module_name: str) -> Optional[float]:
+        """Resolve the threshold for a specific layer by module name.
+
+        Subclasses should set ``self.threshold_scale_factor`` before calling.
+        Checks layer_overrides patterns first (fnmatch), falls back to default.
+        Returns None if threshold is 0 (disabled for this layer).
+        """
+        threshold = getattr(self, "threshold_scale_factor", None)
+        if threshold is None:
+            return None
+        if self.layer_overrides:
+            for pattern, override in self.layer_overrides.items():
+                if fnmatch.fnmatch(module_name, pattern):
+                    threshold = override
+                    break
+        return threshold if threshold > 0 else None
+
+
+class SkipSoftmaxFormula(StrictBaseModel):
+    """Exponential calibration formula: threshold = a * exp(b * sparsity)."""
+
+    a: float = PydanticField(description="Coefficient a")
+    b: float = PydanticField(description="Coefficient b")
+
+
+class SkipSoftmaxConfig(BaseSparseAttentionConfig):
+    """SkipSoftmax sparse attention configuration.
+
+    Dynamically skips softmax + BMM2 for KV blocks whose contribution falls
+    below a threshold. The kernel decision rule is:
+        skip if exp(local_max - global_max) < threshold_scale_factor / seq_len
+
+    Requires backend='TRTLLM'. See docs/source/features/sparse-attention.md.
+
+    Two ways to specify the threshold:
+    1. threshold_scale_factor: raw value, resolution-dependent
+    2. target_sparsity + formula: resolution-aware, uses a * exp(b * sparsity)
+       Formula coefficients can come from checkpoint config.json or user config.
+    """
+
+    algorithm: Literal["skip_softmax"] = "skip_softmax"
+    threshold_scale_factor: Optional[float] = PydanticField(
+        None,
+        description="Default threshold scale factor for all attention layers. "
+        "Higher = more aggressive skipping. Takes precedence over target_sparsity.",
+    )
+    target_sparsity: Optional[float] = PydanticField(
+        None,
+        description="Target sparsity (0.0-1.0). Converted to threshold_scale_factor "
+        "via calibration formula. Requires formula coefficients from checkpoint "
+        "config.json or from the 'formula' field.",
+    )
+    formula: Optional[SkipSoftmaxFormula] = PydanticField(
+        None,
+        description="Calibration formula coefficients for target_sparsity → "
+        "threshold_scale_factor conversion. Takes precedence over checkpoint "
+        "config.json formula.",
+    )
+
+    def resolve_threshold_scale_factor(
+        self,
+        checkpoint_formula: Optional[Dict[str, float]] = None,
+    ) -> Optional[float]:
+        """Resolve to a concrete threshold_scale_factor.
+
+        Priority:
+        1. self.threshold_scale_factor (if set, use directly)
+        2. self.target_sparsity + formula from:
+           a. self.formula (user config — highest precedence)
+           b. checkpoint_formula (from checkpoint config.json — fallback)
+
+        Returns:
+            Resolved threshold_scale_factor, or None if cannot resolve.
+        """
+        if self.threshold_scale_factor is not None:
+            return self.threshold_scale_factor
+
+        if self.target_sparsity is None:
+            return None
+
+        # User formula takes precedence over checkpoint formula
+        coeffs = (
+            {"a": self.formula.a, "b": self.formula.b} if self.formula else None
+        ) or checkpoint_formula
+        if coeffs is None or "a" not in coeffs or "b" not in coeffs:
+            raise ValueError(
+                "SkipSoftmaxConfig: target_sparsity requires calibration formula "
+                "coefficients (a, b). Provide via checkpoint config.json "
+                "(sparse_attention_config.formula) or user config (formula field)."
+            )
+        return coeffs["a"] * math.exp(coeffs["b"] * self.target_sparsity)
+
+
+# Discriminated union of all sparse attention configs.
+# Add new algorithms here as: Annotated[Union[SkipSoftmaxConfig, ...], Field(discriminator="algorithm")]
+SparseAttentionConfig = Annotated[
+    Union[SkipSoftmaxConfig],
+    PydanticField(discriminator="algorithm"),
+]
+
+
 class AttentionConfig(StrictBaseModel):
     """Configuration for Attention layers."""
 
     backend: Literal["VANILLA", "TRTLLM", "FA4"] = PydanticField(
         "VANILLA", description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4"
     )
+<<<<<<< HEAD
     sage_attention_config: Optional[SageAttentionConfig] = PydanticField(
         None,
         description=(
@@ -119,6 +240,51 @@ class AttentionConfig(StrictBaseModel):
             ) not in SUPPORTED_SAGE_CONFIGS:
                 raise ValueError(f"Unsupported {self.sage_attention_config=}.")
         return self
+
+    sparse_attention_config: Optional[SparseAttentionConfig] = PydanticField(
+        None, description="Sparse attention configuration. Currently supports: skip_softmax."
+    )
+
+
+def apply_skip_softmax_overrides(model: "torch.nn.Module", skip_softmax: SkipSoftmaxConfig) -> int:
+    """Apply layer_overrides from SkipSoftmaxConfig to a constructed model.
+
+    Walks named_modules(), matches names against layer_overrides patterns,
+    and sets per-layer sparse_attention_config on TRTLLM backends.
+
+    Call this after model construction when layer_overrides is specified.
+
+    Returns:
+        Number of backends modified.
+    """
+    if skip_softmax.layer_overrides is None:
+        return 0
+
+    from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
+    from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+    modified = 0
+    for name, module in model.named_modules():
+        threshold = skip_softmax.resolve_threshold(name)
+        # Find TRTLLM backend: could be direct .attn or inside UlyssesAttention
+        attn = getattr(module, "attn", None)
+        targets = []
+        if isinstance(attn, TrtllmAttention):
+            targets.append(attn)
+        inner = getattr(attn, "inner_backend", None)
+        if isinstance(inner, TrtllmAttention):
+            targets.append(inner)
+
+        for target in targets:
+            if threshold is not None:
+                target.sparse_attention_config = SkipSoftmaxAttentionConfig(
+                    threshold_scale_factor={"prefill": threshold, "decode": 0}
+                )
+            else:
+                target.sparse_attention_config = None
+            modified += 1
+
+    return modified
 
 
 class ParallelConfig(StrictBaseModel):
