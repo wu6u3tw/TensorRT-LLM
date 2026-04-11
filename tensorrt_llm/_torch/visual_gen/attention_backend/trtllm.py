@@ -191,7 +191,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             quant_config=quant_config,
             dtype=dtype,
         )
-        # SkipSoftmax: BaseTrtllmAttention.forward() reads from this
         self.sparse_attention_config = sparse_attention_config
 
         # TRTLLM expects flat [B*S, H*D] format

@@ -10,7 +10,7 @@ from ...modules.linear import Linear, WeightMode, WeightsLoadingConfig
 from ...modules.rms_norm import RMSNorm
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.utils import create_attention
-from ..config import DiffusionModelConfig
+from ..config import DiffusionModelConfig, SkipSoftmaxConfig
 
 
 class QKVMode(str, Enum):
@@ -82,8 +82,7 @@ class Attention(nn.Module):
         ulysses_size = vgm.ulysses_size if vgm else 1
         base_backend = config.attention.backend
 
-        # TRTLLM C++ requires fused QKV for non-MLA attention (attentionOp.cpp:640).
-        # Cross-attention has different Q/KV seq_len → can't fuse. Use VANILLA.
+        # TRTLLM doesn't support cross-attention (different Q/KV seq lengths); fall back to VANILLA
         if self.qkv_mode == QKVMode.SEPARATE_QKV and base_backend == "TRTLLM":
             backend_name = "VANILLA"
         else:
@@ -148,8 +147,6 @@ class Attention(nn.Module):
 
         # Resolve sparse attention config for TRTLLM backend
         sparse_attention_config = None
-        from ..config import SkipSoftmaxConfig
-
         ss_cfg = config.attention.sparse_attention_config
         if isinstance(ss_cfg, SkipSoftmaxConfig) and backend_name == "TRTLLM":
             # SM90 (Hopper) does not support skip_softmax with full (non-causal)
