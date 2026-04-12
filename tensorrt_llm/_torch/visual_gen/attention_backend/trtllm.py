@@ -261,7 +261,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             seq_len_kv: Sequence length for K/V (for cross-attention, defaults to seq_len)
 
         Returns:
-            Output tensor [B, S_q, H*D]
+            Output tensor [B, S, H*D]
         """
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
