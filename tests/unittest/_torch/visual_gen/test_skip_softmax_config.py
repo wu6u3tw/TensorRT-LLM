@@ -233,35 +233,51 @@ class TestResolveThreshold:
 
 class TestApplySkipSoftmaxOverrides:
     def _make_mock_model(self):
-        """Create a minimal mock model with TrtllmAttention-like backends."""
+        """Create a mock model with patched TrtllmAttention instances."""
+        from unittest.mock import MagicMock
+
         import torch.nn as nn
 
-        class MockTrtllmAttention:
-            sparse_attention_config = None
+        from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
+
+        def make_mock_backend():
+            mock = MagicMock(spec=TrtllmAttention)
+            mock.sparse_attention_config = None
+            return mock
 
         class MockAttentionModule(nn.Module):
-            def __init__(self, name):
+            def __init__(self):
                 super().__init__()
-                self.attn = MockTrtllmAttention()
+                self.attn = make_mock_backend()
 
         class MockModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.block0 = MockAttentionModule("block0")
-                self.block1 = MockAttentionModule("block1")
-                self.block2 = MockAttentionModule("block2")
+                self.block0 = MockAttentionModule()
+                self.block1 = MockAttentionModule()
+                self.block2 = MockAttentionModule()
 
-        # Monkey-patch isinstance check since we can't import the real class
-        # in unit tests without GPU
         return MockModel()
 
     def test_no_overrides_returns_zero(self):
         model = self._make_mock_model()
         cfg = SkipSoftmaxConfig(threshold_scale_factor=5000.0)
-        # No layer_overrides → returns 0
         assert apply_skip_softmax_overrides(model, cfg) == 0
 
-    def test_overrides_count(self):
-        # This test would need real TrtllmAttention instances
-        # which require GPU. Skip in unit test, test in integration.
-        pass
+    def test_overrides_applied(self):
+        model = self._make_mock_model()
+        cfg = SkipSoftmaxConfig(
+            threshold_scale_factor=5000.0,
+            layer_overrides={"block0.*": 0, "block2.*": 8000.0},
+        )
+        n = apply_skip_softmax_overrides(model, cfg)
+        assert n == 3
+
+        # block0: disabled (threshold=0 → None)
+        assert model.block0.attn.sparse_attention_config is None
+        # block1: default threshold
+        assert model.block1.attn.sparse_attention_config is not None
+        assert model.block1.attn.sparse_attention_config.threshold_scale_factor_prefill == 5000.0
+        # block2: overridden to 8000
+        assert model.block2.attn.sparse_attention_config is not None
+        assert model.block2.attn.sparse_attention_config.threshold_scale_factor_prefill == 8000.0
