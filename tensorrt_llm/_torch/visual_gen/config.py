@@ -246,6 +246,38 @@ class AttentionConfig(StrictBaseModel):
     )
 
 
+def auto_detect_sparse_attention_config(
+    checkpoint_config: Dict[str, Any],
+) -> Optional[SkipSoftmaxConfig]:
+    """Auto-detect sparse attention config from a ModelOpt checkpoint config.json.
+
+    If the checkpoint contains calibrated skip_softmax metadata (formula coefficients),
+    creates a SkipSoftmaxConfig with the formula so users can just set target_sparsity
+    without providing their own formula. If no sparse config is found, returns None.
+
+    Args:
+        checkpoint_config: Parsed contents of the checkpoint's config.json.
+
+    Returns:
+        SkipSoftmaxConfig with formula from checkpoint, or None.
+    """
+    sparse_cfg = checkpoint_config.get("sparse_attention_config")
+    if not isinstance(sparse_cfg, dict):
+        return None
+
+    tsf = sparse_cfg.get("threshold_scale_factor")
+    if not isinstance(tsf, dict):
+        return None
+
+    prefill = tsf.get("prefill")
+    if not isinstance(prefill, dict) or "a" not in prefill or "b" not in prefill:
+        return None
+
+    return SkipSoftmaxConfig(
+        formula=SkipSoftmaxFormula(a=prefill["a"], b=prefill["b"]),
+    )
+
+
 def apply_skip_softmax_overrides(model: "torch.nn.Module", skip_softmax: SkipSoftmaxConfig) -> int:
     """Apply layer_overrides from SkipSoftmaxConfig to a constructed model.
 
@@ -1178,6 +1210,20 @@ class DiffusionModelConfig(BaseModel):
                     f"Config not found at {checkpoint_dir}. "
                     "Expected model_index.json (diffusers) or "
                     "safetensors with embedded config metadata."
+                )
+
+        # Auto-detect sparse attention config from checkpoint (e.g. ModelOpt)
+        # if user didn't explicitly provide one
+        if attention_cfg.sparse_attention_config is None:
+            ckpt_dict = vars(pretrained_config) if pretrained_config else {}
+            ckpt_sparse = auto_detect_sparse_attention_config(ckpt_dict)
+            if ckpt_sparse is not None:
+                attention_cfg = attention_cfg.model_copy(
+                    update={"sparse_attention_config": ckpt_sparse}
+                )
+                logger.info(
+                    "Auto-detected sparse_attention_config from checkpoint "
+                    f"(formula: a={ckpt_sparse.formula.a}, b={ckpt_sparse.formula.b})"
                 )
 
         # Resolve quant config

@@ -93,6 +93,127 @@ class TestSkipSoftmaxConfigConstruction:
 
 
 # =============================================================================
+# Use case scenarios
+# =============================================================================
+
+
+class TestUseCaseScenarios:
+    """End-to-end use case tests matching the PR documentation.
+
+    Case 1: Normal HF checkpoint (no skip_softmax metadata in config.json)
+      1a: User provides threshold_scale_factor → all layers get same threshold
+      1b: User provides target_sparsity without formula → helpful error
+      1c: User provides target_sparsity + formula → resolves correctly
+      1d: User provides full config with layer_overrides → per-layer thresholds
+
+    Case 2: ModelOpt checkpoint (has calibrated a, b in config.json)
+      2a: User provides nothing → auto-enable from checkpoint
+      2b: User provides threshold_scale_factor → user overrides checkpoint
+      2c: User provides target_sparsity → uses checkpoint formula
+    """
+
+    MODELOPT_CHECKPOINT = {
+        "sparse_attention_config": {
+            "config_groups": {
+                "group_0": {
+                    "sparse_algo": "softmax_skip",
+                    "targets": ["Attention"],
+                }
+            },
+            "threshold_scale_factor": {
+                "formula": "a * exp(b * target_sparsity)",
+                "prefill": {"a": 7.93, "b": 8.61},
+                "decode": {"a": 0.12, "b": 9.85},
+            },
+            "producer": {"name": "modelopt", "version": "0.37.0"},
+        }
+    }
+
+    # --- Case 1: Normal HF checkpoint ---
+
+    def test_case_1a_user_threshold_only(self):
+        """Normal checkpoint + user threshold → works."""
+        cfg = SkipSoftmaxConfig(threshold_scale_factor=5000.0)
+        result = cfg.resolve_threshold_scale_factor(checkpoint_formula=None)
+        assert result == 5000.0
+
+    def test_case_1b_user_target_sparsity_no_formula(self):
+        """Normal checkpoint + target_sparsity without formula → helpful error."""
+        cfg = SkipSoftmaxConfig(target_sparsity=0.5)
+        with pytest.raises(ValueError, match="calibration formula"):
+            cfg.resolve_threshold_scale_factor(checkpoint_formula=None)
+
+    def test_case_1c_user_target_sparsity_with_formula(self):
+        """Normal checkpoint + target_sparsity + user formula → resolves."""
+        cfg = SkipSoftmaxConfig(
+            target_sparsity=0.5,
+            formula=SkipSoftmaxFormula(a=0.0003, b=7.5),
+        )
+        result = cfg.resolve_threshold_scale_factor(checkpoint_formula=None)
+        expected = 0.0003 * math.exp(7.5 * 0.5)
+        assert result == pytest.approx(expected)
+
+    def test_case_1d_user_with_layer_overrides(self):
+        """Normal checkpoint + layer_overrides → per-layer thresholds."""
+        cfg = SkipSoftmaxConfig(
+            threshold_scale_factor=5000.0,
+            layer_overrides={"blocks.0*": 0, "blocks.5*": 8000.0},
+        )
+        assert cfg.resolve_threshold("blocks.0.attn1") is None  # disabled
+        assert cfg.resolve_threshold("blocks.5.attn1") == 8000.0  # override
+        assert cfg.resolve_threshold("blocks.3.attn1") == 5000.0  # default
+
+    # --- Case 2: ModelOpt checkpoint ---
+
+    def test_case_2a_modelopt_checkpoint_auto_enable(self):
+        """ModelOpt checkpoint + no user config → auto-enable from checkpoint.
+
+        The pipeline should detect sparse_attention_config in checkpoint
+        config.json and create a SkipSoftmaxConfig automatically.
+        """
+        from tensorrt_llm._torch.visual_gen.config import auto_detect_sparse_attention_config
+
+        ckpt = self.MODELOPT_CHECKPOINT
+        result = auto_detect_sparse_attention_config(ckpt)
+        assert result is not None
+        assert isinstance(result, SkipSoftmaxConfig)
+        # Should have the formula from checkpoint
+        assert result.formula is not None
+        assert result.formula.a == pytest.approx(7.93)
+        assert result.formula.b == pytest.approx(8.61)
+
+    def test_case_2b_modelopt_user_threshold_overrides(self):
+        """ModelOpt checkpoint + user threshold → user wins."""
+        cfg = SkipSoftmaxConfig(threshold_scale_factor=3000.0)
+        ckpt_formula = self.MODELOPT_CHECKPOINT["sparse_attention_config"][
+            "threshold_scale_factor"
+        ]["prefill"]
+        result = cfg.resolve_threshold_scale_factor(checkpoint_formula=ckpt_formula)
+        # User threshold takes precedence, checkpoint formula ignored
+        assert result == 3000.0
+
+    def test_case_2c_modelopt_user_target_sparsity(self):
+        """ModelOpt checkpoint + user target_sparsity → uses checkpoint formula."""
+        cfg = SkipSoftmaxConfig(target_sparsity=0.5)
+        ckpt_formula = self.MODELOPT_CHECKPOINT["sparse_attention_config"][
+            "threshold_scale_factor"
+        ]["prefill"]
+        result = cfg.resolve_threshold_scale_factor(checkpoint_formula=ckpt_formula)
+        expected = 7.93 * math.exp(8.61 * 0.5)
+        assert result == pytest.approx(expected)
+
+    def test_case_2a_no_sparse_config_returns_none(self):
+        """Normal checkpoint (no sparse_attention_config) → returns None."""
+        from tensorrt_llm._torch.visual_gen.config import auto_detect_sparse_attention_config
+
+        result = auto_detect_sparse_attention_config({})
+        assert result is None
+
+        result = auto_detect_sparse_attention_config({"other_key": 123})
+        assert result is None
+
+
+# =============================================================================
 # resolve_threshold_scale_factor
 # =============================================================================
 
