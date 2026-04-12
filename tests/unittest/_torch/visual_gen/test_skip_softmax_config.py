@@ -268,7 +268,7 @@ class TestApplySkipSoftmaxOverrides:
         model = self._make_mock_model()
         cfg = SkipSoftmaxConfig(
             threshold_scale_factor=5000.0,
-            layer_overrides={"block0.*": 0, "block2.*": 8000.0},
+            layer_overrides={"block0*": 0, "block2*": 8000.0},
         )
         n = apply_skip_softmax_overrides(model, cfg)
         assert n == 3
