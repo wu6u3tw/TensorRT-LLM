@@ -4,6 +4,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 from tensorrt_llm.logger import logger
 
 from ...modules.linear import Linear, WeightMode, WeightsLoadingConfig
@@ -151,8 +153,6 @@ class Attention(nn.Module):
         if isinstance(ss_cfg, SkipSoftmaxConfig) and backend_name == "TRTLLM":
             # SM90 (Hopper) does not support skip_softmax with full (non-causal)
             # attention mask. Only SM100+ (Blackwell) is supported.
-            from tensorrt_llm._utils import get_sm_version
-
             sm = get_sm_version()
             if sm < 100:
                 logger.warning(
@@ -177,8 +177,6 @@ class Attention(nn.Module):
                 # Store resolved value back for layer_overrides to use
                 if threshold is not None and threshold > 0:
                     ss_cfg.threshold_scale_factor = threshold
-                    from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
-
                     sparse_attention_config = SkipSoftmaxAttentionConfig(
                         threshold_scale_factor={"prefill": threshold, "decode": 0}
                     )

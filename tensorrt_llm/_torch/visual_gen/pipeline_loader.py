@@ -23,6 +23,7 @@ import torch.distributed as dist
 
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+from tensorrt_llm._torch.visual_gen.config import SkipSoftmaxConfig, apply_skip_softmax_overrides
 from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
 
@@ -231,11 +232,6 @@ class PipelineLoader:
             pipeline.post_load_weights()
 
         # Apply per-layer sparse attention overrides (e.g. skip_softmax layer_overrides)
-        from tensorrt_llm._torch.visual_gen.config import (
-            SkipSoftmaxConfig,
-            apply_skip_softmax_overrides,
-        )
-
         sparse_cfg = config.attention.sparse_attention_config
         if isinstance(sparse_cfg, SkipSoftmaxConfig) and sparse_cfg.layer_overrides:
             n = apply_skip_softmax_overrides(pipeline, sparse_cfg)
