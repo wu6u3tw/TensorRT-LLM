@@ -31,10 +31,10 @@ class TestSkipSoftmaxConfigConstruction:
     def test_target_sparsity_with_formula(self):
         cfg = SkipSoftmaxConfig(
             target_sparsity=0.5,
-            formula=SkipSoftmaxFormula(a=0.0003, b=7.5),
+            formula=SkipSoftmaxFormula(log_a=math.log(0.0003), b=7.5),
         )
         assert cfg.target_sparsity == 0.5
-        assert cfg.formula.a == 0.0003
+        assert cfg.formula.log_a == pytest.approx(math.log(0.0003))
         assert cfg.formula.b == 7.5
 
     def test_with_layer_overrides(self):
@@ -75,12 +75,12 @@ class TestSkipSoftmaxConfigConstruction:
                 "sparse_attention_config": {
                     "algorithm": "skip_softmax",
                     "target_sparsity": 0.5,
-                    "formula": {"a": 0.0003, "b": 7.5},
+                    "formula": {"log_a": math.log(0.0003), "b": 7.5},
                 },
             }
         )
         assert cfg.sparse_attention_config.target_sparsity == 0.5
-        assert cfg.sparse_attention_config.formula.a == 0.0003
+        assert cfg.sparse_attention_config.formula.log_a == pytest.approx(math.log(0.0003))
 
     def test_attention_config_no_sparse(self):
         cfg = AttentionConfig(backend="VANILLA")
@@ -147,7 +147,7 @@ class TestUseCaseScenarios:
         """Normal checkpoint + target_sparsity + user formula → resolves."""
         cfg = SkipSoftmaxConfig(
             target_sparsity=0.5,
-            formula=SkipSoftmaxFormula(a=0.0003, b=7.5),
+            formula=SkipSoftmaxFormula(log_a=math.log(0.0003), b=7.5),
         )
         result = cfg.resolve_threshold_scale_factor(checkpoint_formula=None)
         expected = 0.0003 * math.exp(7.5 * 0.5)
@@ -179,7 +179,7 @@ class TestUseCaseScenarios:
         assert isinstance(result, SkipSoftmaxConfig)
         # Should have the formula from checkpoint
         assert result.formula is not None
-        assert result.formula.a == pytest.approx(7.93)
+        assert result.formula.log_a == pytest.approx(math.log(7.93))
         assert result.formula.b == pytest.approx(8.61)
 
     def test_case_2b_modelopt_user_threshold_overrides(self):
@@ -214,6 +214,81 @@ class TestUseCaseScenarios:
 
 
 # =============================================================================
+# YAML loading
+# =============================================================================
+
+
+class TestYamlLoading:
+    def test_load_modelopt_yaml(self, tmp_path):
+        """Load from ModelOpt sparse YAML file."""
+        from tensorrt_llm._torch.visual_gen.config import load_sparse_config_from_yaml
+
+        yaml_content = """
+config_groups:
+  group_0:
+    sparse_algo: softmax_skip
+    targets:
+    - WanAttention
+    threshold_scale_factor:
+      formula: log_a + b * target_sparsity
+      prefill:
+        log_a: -14.14
+        b: 36.64
+    disabled_layers:
+    - blocks.0.attn1
+    - blocks.0.attn2
+    - blocks.39.attn2
+"""
+        yaml_file = tmp_path / "sparse.yaml"
+        yaml_file.write_text(yaml_content)
+
+        cfg = load_sparse_config_from_yaml(str(yaml_file))
+        assert cfg is not None
+        assert cfg.formula.log_a == pytest.approx(-14.14)
+        assert cfg.formula.b == pytest.approx(36.64)
+        assert cfg.layer_overrides is not None
+        assert cfg.layer_overrides["blocks.0.attn1"] == 0
+        assert cfg.layer_overrides["blocks.0.attn2"] == 0
+        assert cfg.layer_overrides["blocks.39.attn2"] == 0
+        assert len(cfg.layer_overrides) == 3
+
+    def test_load_yaml_no_skip_softmax(self, tmp_path):
+        """YAML without softmax_skip algo returns None."""
+        from tensorrt_llm._torch.visual_gen.config import load_sparse_config_from_yaml
+
+        yaml_content = """
+config_groups:
+  group_0:
+    sparse_algo: other_algo
+"""
+        yaml_file = tmp_path / "sparse.yaml"
+        yaml_file.write_text(yaml_content)
+
+        cfg = load_sparse_config_from_yaml(str(yaml_file))
+        assert cfg is None
+
+    def test_auto_detect_yaml(self, tmp_path):
+        """Auto-detect sparse YAML files in checkpoint directory."""
+        from tensorrt_llm._torch.visual_gen.config import auto_detect_sparse_yaml
+
+        yaml_content = """
+config_groups:
+  group_0:
+    sparse_algo: softmax_skip
+    threshold_scale_factor:
+      prefill:
+        log_a: -14.14
+        b: 36.64
+"""
+        (tmp_path / "transformer").mkdir()
+        (tmp_path / "transformer" / "sparse.yaml").write_text(yaml_content)
+
+        configs = auto_detect_sparse_yaml(str(tmp_path))
+        assert configs is not None
+        assert len(configs) >= 1
+
+
+# =============================================================================
 # resolve_threshold_scale_factor
 # =============================================================================
 
@@ -227,7 +302,7 @@ class TestResolveThresholdScaleFactor:
         cfg = SkipSoftmaxConfig(
             threshold_scale_factor=5000.0,
             target_sparsity=0.5,
-            formula=SkipSoftmaxFormula(a=0.0003, b=7.5),
+            formula=SkipSoftmaxFormula(log_a=math.log(0.0003), b=7.5),
         )
         # threshold_scale_factor takes precedence
         assert cfg.resolve_threshold_scale_factor() == 5000.0
@@ -235,7 +310,7 @@ class TestResolveThresholdScaleFactor:
     def test_target_sparsity_with_user_formula(self):
         cfg = SkipSoftmaxConfig(
             target_sparsity=0.5,
-            formula=SkipSoftmaxFormula(a=7e-5, b=7.929109),
+            formula=SkipSoftmaxFormula(log_a=math.log(7e-5), b=7.929109),
         )
         expected = 7e-5 * math.exp(7.929109 * 0.5)
         assert cfg.resolve_threshold_scale_factor() == pytest.approx(expected)
@@ -249,7 +324,7 @@ class TestResolveThresholdScaleFactor:
     def test_user_formula_overrides_checkpoint(self):
         cfg = SkipSoftmaxConfig(
             target_sparsity=0.5,
-            formula=SkipSoftmaxFormula(a=0.001, b=5.0),  # user
+            formula=SkipSoftmaxFormula(log_a=math.log(0.001), b=5.0),  # user
         )
         checkpoint = {"a": 7e-5, "b": 7.929109}  # checkpoint (lower priority)
         expected = 0.001 * math.exp(5.0 * 0.5)  # should use user formula
@@ -275,7 +350,7 @@ class TestResolveThresholdScaleFactor:
     def test_target_sparsity_zero(self):
         cfg = SkipSoftmaxConfig(
             target_sparsity=0.0,
-            formula=SkipSoftmaxFormula(a=7e-5, b=7.929109),
+            formula=SkipSoftmaxFormula(log_a=math.log(7e-5), b=7.929109),
         )
         # exp(0) = 1, so result = a
         assert cfg.resolve_threshold_scale_factor() == pytest.approx(7e-5)
@@ -283,7 +358,7 @@ class TestResolveThresholdScaleFactor:
     def test_target_sparsity_one(self):
         cfg = SkipSoftmaxConfig(
             target_sparsity=1.0,
-            formula=SkipSoftmaxFormula(a=7e-5, b=7.929109),
+            formula=SkipSoftmaxFormula(log_a=math.log(7e-5), b=7.929109),
         )
         expected = 7e-5 * math.exp(7.929109)
         assert cfg.resolve_threshold_scale_factor() == pytest.approx(expected)

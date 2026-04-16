@@ -117,9 +117,14 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
 
 class SkipSoftmaxFormula(StrictBaseModel):
-    """Exponential calibration formula: threshold = a * exp(b * sparsity)."""
+    """Exponential calibration formula: threshold = exp(log_a + b * sparsity).
 
-    a: float = PydanticField(description="Coefficient a")
+    Equivalent to: threshold = a * exp(b * sparsity) where a = exp(log_a).
+    Stored in log-space (log_a) to match ModelOpt diffusion format and
+    avoid precision loss.
+    """
+
+    log_a: float = PydanticField(description="Log of coefficient a (log-space)")
     b: float = PydanticField(description="Coefficient b")
 
 
@@ -134,8 +139,8 @@ class SkipSoftmaxConfig(BaseSparseAttentionConfig):
 
     Two ways to specify the threshold:
     1. threshold_scale_factor: raw value, resolution-dependent
-    2. target_sparsity + formula: resolution-aware, uses a * exp(b * sparsity)
-       Formula coefficients can come from checkpoint config.json or user config.
+    2. target_sparsity + formula: resolution-aware, uses exp(log_a + b * sparsity)
+       Formula coefficients can come from checkpoint/YAML or user config.
     """
 
     algorithm: Literal["skip_softmax"] = "skip_softmax"
@@ -179,16 +184,27 @@ class SkipSoftmaxConfig(BaseSparseAttentionConfig):
             return None
 
         # User formula takes precedence over checkpoint formula
-        coeffs = (
-            {"a": self.formula.a, "b": self.formula.b} if self.formula else None
-        ) or checkpoint_formula
-        if coeffs is None or "a" not in coeffs or "b" not in coeffs:
+        if self.formula:
+            log_a, b = self.formula.log_a, self.formula.b
+        elif checkpoint_formula:
+            # Support both log_a (diffusion) and a (LLM) formats
+            if "log_a" in checkpoint_formula:
+                log_a = checkpoint_formula["log_a"]
+            elif "a" in checkpoint_formula:
+                log_a = math.log(checkpoint_formula["a"])
+            else:
+                log_a = None
+            b = checkpoint_formula.get("b")
+        else:
+            log_a, b = None, None
+
+        if log_a is None or b is None:
             raise ValueError(
                 "SkipSoftmaxConfig: target_sparsity requires calibration formula "
-                "coefficients (a, b). Provide via checkpoint config.json "
-                "(sparse_attention_config.formula) or user config (formula field)."
+                "coefficients. Provide via ModelOpt YAML (log_a, b), checkpoint "
+                "config.json (a, b), or user config (formula field)."
             )
-        return coeffs["a"] * math.exp(coeffs["b"] * self.target_sparsity)
+        return math.exp(log_a + b * self.target_sparsity)
 
 
 # Discriminated union of all sparse attention configs.
@@ -244,6 +260,86 @@ class AttentionConfig(StrictBaseModel):
     sparse_attention_config: Optional[SparseAttentionConfig] = PydanticField(
         None, description="Sparse attention configuration. Currently supports: skip_softmax."
     )
+    sparse_config_path: Optional[str] = PydanticField(
+        None,
+        description="Path to ModelOpt sparse attention YAML config file. "
+        "Overrides auto-detection from checkpoint directory.",
+    )
+
+
+def load_sparse_config_from_yaml(yaml_path: str) -> Optional[SkipSoftmaxConfig]:
+    """Load SkipSoftmaxConfig from a ModelOpt sparse attention YAML file.
+
+    ModelOpt YAML format:
+        config_groups:
+          group_0:
+            sparse_algo: softmax_skip
+            threshold_scale_factor:
+              formula: log_a + b * target_sparsity
+              prefill:
+                log_a: -14.14
+                b: 36.64
+            disabled_layers:
+              - blocks.0.attn1
+              - blocks.0.attn2
+
+    Args:
+        yaml_path: Path to the YAML file.
+
+    Returns:
+        SkipSoftmaxConfig, or None if the file doesn't contain skip_softmax config.
+    """
+    with open(yaml_path) as f:
+        data = yaml.safe_load(f)
+
+    if not isinstance(data, dict):
+        return None
+
+    # Find the first config group with sparse_algo: softmax_skip
+    config_groups = data.get("config_groups", {})
+    for group in config_groups.values():
+        if group.get("sparse_algo") != "softmax_skip":
+            continue
+
+        tsf = group.get("threshold_scale_factor", {})
+        prefill = tsf.get("prefill", {})
+        if "log_a" not in prefill or "b" not in prefill:
+            continue
+
+        # Build layer_overrides from disabled_layers (threshold=0 → disabled)
+        disabled = group.get("disabled_layers", [])
+        layer_overrides = {name: 0 for name in disabled} if disabled else None
+
+        return SkipSoftmaxConfig(
+            formula=SkipSoftmaxFormula(log_a=prefill["log_a"], b=prefill["b"]),
+            layer_overrides=layer_overrides,
+        )
+
+    return None
+
+
+def auto_detect_sparse_yaml(checkpoint_dir: str) -> Optional[Dict[str, SkipSoftmaxConfig]]:
+    """Auto-detect ModelOpt sparse YAML files in a checkpoint directory.
+
+    Looks for files matching ``sparse.yaml`` or ``sparse.*.yaml`` in the
+    checkpoint's component directories (e.g. transformer/, transformer_2/).
+
+    Returns:
+        Dict mapping component name to SkipSoftmaxConfig, or None.
+    """
+
+    checkpoint_path = Path(checkpoint_dir)
+    configs = {}
+
+    # Look in component subdirectories (diffusers layout)
+    for yaml_path in sorted(checkpoint_path.glob("**/sparse*.yaml")):
+        cfg = load_sparse_config_from_yaml(str(yaml_path))
+        if cfg is not None:
+            # Derive component name from filename or parent directory
+            name = yaml_path.stem  # e.g. "sparse" or "sparse.transformer_2"
+            configs[name] = cfg
+
+    return configs if configs else None
 
 
 def auto_detect_sparse_attention_config(
@@ -270,12 +366,20 @@ def auto_detect_sparse_attention_config(
         return None
 
     prefill = tsf.get("prefill")
-    if not isinstance(prefill, dict) or "a" not in prefill or "b" not in prefill:
+    if not isinstance(prefill, dict):
         return None
 
-    return SkipSoftmaxConfig(
-        formula=SkipSoftmaxFormula(a=prefill["a"], b=prefill["b"]),
-    )
+    # Support both LLM format (a, b) and ModelOpt diffusion format (log_a, b)
+    if "log_a" in prefill and "b" in prefill:
+        return SkipSoftmaxConfig(
+            formula=SkipSoftmaxFormula(log_a=prefill["log_a"], b=prefill["b"]),
+        )
+    elif "a" in prefill and "b" in prefill:
+        return SkipSoftmaxConfig(
+            formula=SkipSoftmaxFormula(log_a=math.log(prefill["a"]), b=prefill["b"]),
+        )
+
+    return None
 
 
 def apply_skip_softmax_overrides(model: "torch.nn.Module", skip_softmax: SkipSoftmaxConfig) -> int:
@@ -1212,9 +1316,39 @@ class DiffusionModelConfig(BaseModel):
                     "safetensors with embedded config metadata."
                 )
 
-        # Auto-detect sparse attention config from checkpoint (e.g. ModelOpt)
-        # if user didn't explicitly provide one
+        # Load sparse attention config. Priority:
+        # 1. User-provided sparse_attention_config in VisualGenArgs (already set)
+        # 2. User-provided sparse_config_path (manual YAML path)
+        # 3. Auto-detect sparse.yaml in checkpoint directory
+        # 4. Auto-detect from config.json (LLM-style)
         if attention_cfg.sparse_attention_config is None:
+            # Try manual YAML path first
+            yaml_path = attention_cfg.sparse_config_path
+            if yaml_path is not None:
+                ckpt_sparse = load_sparse_config_from_yaml(yaml_path)
+                if ckpt_sparse is not None:
+                    attention_cfg = attention_cfg.model_copy(
+                        update={"sparse_attention_config": ckpt_sparse}
+                    )
+                    logger.info(f"Loaded sparse_attention_config from {yaml_path}")
+
+        if attention_cfg.sparse_attention_config is None:
+            # Try auto-detect YAML files in checkpoint directory
+            yaml_configs = auto_detect_sparse_yaml(str(checkpoint_path))
+            if yaml_configs:
+                # Use the first config found (typically "sparse" for transformer)
+                first_key = next(iter(yaml_configs))
+                ckpt_sparse = yaml_configs[first_key]
+                attention_cfg = attention_cfg.model_copy(
+                    update={"sparse_attention_config": ckpt_sparse}
+                )
+                logger.info(
+                    f"Auto-detected sparse_attention_config from {first_key}.yaml "
+                    f"(formula: log_a={ckpt_sparse.formula.log_a:.2f}, b={ckpt_sparse.formula.b:.2f})"
+                )
+
+        if attention_cfg.sparse_attention_config is None:
+            # Try auto-detect from config.json
             ckpt_dict = vars(pretrained_config) if pretrained_config else {}
             ckpt_sparse = auto_detect_sparse_attention_config(ckpt_dict)
             if ckpt_sparse is not None:
@@ -1222,8 +1356,8 @@ class DiffusionModelConfig(BaseModel):
                     update={"sparse_attention_config": ckpt_sparse}
                 )
                 logger.info(
-                    "Auto-detected sparse_attention_config from checkpoint "
-                    f"(formula: a={ckpt_sparse.formula.a}, b={ckpt_sparse.formula.b})"
+                    f"Auto-detected sparse_attention_config from config.json "
+                    f"(formula: log_a={ckpt_sparse.formula.log_a:.2f}, b={ckpt_sparse.formula.b:.2f})"
                 )
 
         # Resolve quant config
