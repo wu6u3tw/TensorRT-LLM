@@ -1316,48 +1316,63 @@ class DiffusionModelConfig(BaseModel):
                     "safetensors with embedded config metadata."
                 )
 
-        # Load sparse attention config. Priority:
-        # 1. User-provided sparse_attention_config in VisualGenArgs (already set)
-        # 2. User-provided sparse_config_path (manual YAML path)
-        # 3. Auto-detect sparse.yaml in checkpoint directory
-        # 4. Auto-detect from config.json (LLM-style)
-        if attention_cfg.sparse_attention_config is None:
-            # Try manual YAML path first
-            yaml_path = attention_cfg.sparse_config_path
-            if yaml_path is not None:
-                ckpt_sparse = load_sparse_config_from_yaml(yaml_path)
-                if ckpt_sparse is not None:
-                    attention_cfg = attention_cfg.model_copy(
-                        update={"sparse_attention_config": ckpt_sparse}
-                    )
-                    logger.info(f"Loaded sparse_attention_config from {yaml_path}")
+        # Load sparse attention config.
+        # Step 1: Load base config from YAML/checkpoint (formula + disabled_layers)
+        # Step 2: Merge user-provided fields on top (target_sparsity, threshold)
+        yaml_sparse = None
 
-        if attention_cfg.sparse_attention_config is None:
-            # Try auto-detect YAML files in checkpoint directory
+        # Try manual YAML path
+        yaml_path = attention_cfg.sparse_config_path
+        if yaml_path is not None:
+            yaml_sparse = load_sparse_config_from_yaml(yaml_path)
+            if yaml_sparse is not None:
+                logger.info(f"Loaded sparse config from {yaml_path}")
+
+        # Try auto-detect YAML in checkpoint
+        if yaml_sparse is None:
             yaml_configs = auto_detect_sparse_yaml(str(checkpoint_path))
             if yaml_configs:
-                # Use the first config found (typically "sparse" for transformer)
                 first_key = next(iter(yaml_configs))
-                ckpt_sparse = yaml_configs[first_key]
-                attention_cfg = attention_cfg.model_copy(
-                    update={"sparse_attention_config": ckpt_sparse}
-                )
+                yaml_sparse = yaml_configs[first_key]
                 logger.info(
-                    f"Auto-detected sparse_attention_config from {first_key}.yaml "
-                    f"(formula: log_a={ckpt_sparse.formula.log_a:.2f}, b={ckpt_sparse.formula.b:.2f})"
+                    f"Auto-detected sparse config from {first_key}.yaml "
+                    f"(formula: log_a={yaml_sparse.formula.log_a:.2f}, b={yaml_sparse.formula.b:.2f})"
                 )
 
-        if attention_cfg.sparse_attention_config is None:
-            # Try auto-detect from config.json
+        # Try auto-detect from config.json
+        if yaml_sparse is None:
             ckpt_dict = vars(pretrained_config) if pretrained_config else {}
-            ckpt_sparse = auto_detect_sparse_attention_config(ckpt_dict)
-            if ckpt_sparse is not None:
-                attention_cfg = attention_cfg.model_copy(
-                    update={"sparse_attention_config": ckpt_sparse}
-                )
+            yaml_sparse = auto_detect_sparse_attention_config(ckpt_dict)
+            if yaml_sparse is not None:
                 logger.info(
-                    f"Auto-detected sparse_attention_config from config.json "
-                    f"(formula: log_a={ckpt_sparse.formula.log_a:.2f}, b={ckpt_sparse.formula.b:.2f})"
+                    f"Auto-detected sparse config from config.json "
+                    f"(formula: log_a={yaml_sparse.formula.log_a:.2f}, b={yaml_sparse.formula.b:.2f})"
+                )
+
+        # Merge: YAML provides formula + disabled_layers, user provides
+        # target_sparsity / threshold_scale_factor / additional overrides
+        if yaml_sparse is not None:
+            user_cfg = attention_cfg.sparse_attention_config
+            if user_cfg is not None and isinstance(user_cfg, SkipSoftmaxConfig):
+                # User provided some fields — merge on top of YAML
+                merged = yaml_sparse.model_copy(
+                    update={
+                        k: v
+                        for k, v in {
+                            "threshold_scale_factor": user_cfg.threshold_scale_factor,
+                            "target_sparsity": user_cfg.target_sparsity,
+                            "formula": user_cfg.formula or yaml_sparse.formula,
+                            "layer_overrides": user_cfg.layer_overrides
+                            or yaml_sparse.layer_overrides,
+                        }.items()
+                        if v is not None
+                    }
+                )
+                attention_cfg = attention_cfg.model_copy(update={"sparse_attention_config": merged})
+            else:
+                # No user config — use YAML as-is
+                attention_cfg = attention_cfg.model_copy(
+                    update={"sparse_attention_config": yaml_sparse}
                 )
 
         # Resolve quant config
