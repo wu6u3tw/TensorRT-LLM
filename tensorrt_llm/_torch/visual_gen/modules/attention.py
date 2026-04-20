@@ -4,9 +4,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
-from tensorrt_llm.logger import logger
 
 from ...modules.linear import Linear, WeightMode, WeightsLoadingConfig
 from ...modules.rms_norm import RMSNorm
@@ -151,35 +149,26 @@ class Attention(nn.Module):
         sparse_attention_config = None
         ss_cfg = config.attention.sparse_attention_config
         if isinstance(ss_cfg, SkipSoftmaxConfig) and backend_name == "TRTLLM":
-            # SM90 (Hopper) does not support skip_softmax with full (non-causal)
-            # attention mask. Only SM100+ (Blackwell) is supported.
-            sm = get_sm_version()
-            if sm < 100:
-                logger.warning(
-                    "skip_softmax requires SM100+ (Blackwell). "
-                    f"Current GPU is SM{sm} — disabling skip_softmax."
+            # Resolve target_sparsity → threshold_scale_factor if needed.
+            # Formula coefficients: user config > checkpoint config.json.
+            # ModelOpt checkpoint format:
+            #   sparse_attention_config.threshold_scale_factor.prefill: {a, b}
+            checkpoint_formula = None
+            hf_cfg = getattr(config, "hf_config", None)
+            if hf_cfg is not None:
+                sparse_ckpt = getattr(hf_cfg, "sparse_attention_config", None)
+                if isinstance(sparse_ckpt, dict):
+                    tsf = sparse_ckpt.get("threshold_scale_factor", {})
+                    checkpoint_formula = tsf.get("prefill")
+
+            threshold = ss_cfg.resolve_threshold_scale_factor(checkpoint_formula)
+
+            # Store resolved value back for layer_overrides to use
+            if threshold is not None and threshold > 0:
+                ss_cfg.threshold_scale_factor = threshold
+                sparse_attention_config = SkipSoftmaxAttentionConfig(
+                    threshold_scale_factor={"prefill": threshold, "decode": 0}
                 )
-            else:
-                # Resolve target_sparsity → threshold_scale_factor if needed.
-                # Formula coefficients: user config > checkpoint config.json.
-                # ModelOpt checkpoint format:
-                #   sparse_attention_config.threshold_scale_factor.prefill: {a, b}
-                checkpoint_formula = None
-                hf_cfg = getattr(config, "hf_config", None)
-                if hf_cfg is not None:
-                    sparse_ckpt = getattr(hf_cfg, "sparse_attention_config", None)
-                    if isinstance(sparse_ckpt, dict):
-                        tsf = sparse_ckpt.get("threshold_scale_factor", {})
-                        checkpoint_formula = tsf.get("prefill")
-
-                threshold = ss_cfg.resolve_threshold_scale_factor(checkpoint_formula)
-
-                # Store resolved value back for layer_overrides to use
-                if threshold is not None and threshold > 0:
-                    ss_cfg.threshold_scale_factor = threshold
-                    sparse_attention_config = SkipSoftmaxAttentionConfig(
-                        threshold_scale_factor={"prefill": threshold, "decode": 0}
-                    )
 
         # Create compute backend
         self.attn = create_attention(
