@@ -121,11 +121,34 @@ class SkipSoftmaxFormula(StrictBaseModel):
 
     Equivalent to: threshold = a * exp(b * sparsity) where a = exp(log_a).
     Stored in log-space (log_a) to match ModelOpt diffusion format and
-    avoid precision loss.
+    avoid precision loss. Accepts either 'log_a' (diffusion format) or 'a'
+    (LLM format) at construction; 'a' is normalized to log_a = log(a).
     """
 
     log_a: float = PydanticField(description="Log of coefficient a (log-space)")
     b: float = PydanticField(description="Coefficient b")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_linear_a(cls, values):
+        """Normalize LLM-format 'a' to diffusion-format 'log_a'."""
+        if not isinstance(values, dict) or "a" not in values:
+            return values
+        if "log_a" in values:
+            raise ValueError(
+                "SkipSoftmaxFormula: specify either 'log_a' (diffusion format) "
+                "or 'a' (LLM format), not both."
+            )
+        a = values["a"]
+        if a <= 0:
+            raise ValueError(
+                f"SkipSoftmaxFormula: 'a' must be positive (got {a}). "
+                "Use 'log_a' directly if you need log(a) of a non-positive value."
+            )
+        values = {**values}
+        values["log_a"] = math.log(a)
+        values.pop("a")
+        return values
 
 
 class SkipSoftmaxConfig(BaseSparseAttentionConfig):
@@ -270,7 +293,9 @@ class AttentionConfig(StrictBaseModel):
 def load_sparse_config_from_yaml(yaml_path: str) -> Optional[SkipSoftmaxConfig]:
     """Load SkipSoftmaxConfig from a ModelOpt sparse attention YAML file.
 
-    ModelOpt YAML format:
+    Supports both ModelOpt diffusion format (log_a) and LLM format (a):
+
+        # Diffusion format
         config_groups:
           group_0:
             sparse_algo: softmax_skip
@@ -279,9 +304,16 @@ def load_sparse_config_from_yaml(yaml_path: str) -> Optional[SkipSoftmaxConfig]:
               prefill:
                 log_a: -14.14
                 b: 36.64
-            disabled_layers:
-              - blocks.0.attn1
-              - blocks.0.attn2
+
+        # LLM format (auto-converted: log_a = log(a))
+        config_groups:
+          group_0:
+            sparse_algo: softmax_skip
+            threshold_scale_factor:
+              formula: a * exp(b * target_sparsity)
+              prefill:
+                a: 7e-5
+                b: 7.93
 
     Args:
         yaml_path: Path to the YAML file.
@@ -303,15 +335,17 @@ def load_sparse_config_from_yaml(yaml_path: str) -> Optional[SkipSoftmaxConfig]:
 
         tsf = group.get("threshold_scale_factor", {})
         prefill = tsf.get("prefill", {})
-        if "log_a" not in prefill or "b" not in prefill:
+        if "b" not in prefill or ("log_a" not in prefill and "a" not in prefill):
             continue
 
         # Build layer_overrides from disabled_layers (threshold=0 → disabled)
         disabled = group.get("disabled_layers", [])
         layer_overrides = {name: 0 for name in disabled} if disabled else None
 
+        # Filter to known keys; SkipSoftmaxFormula validator normalizes 'a' → 'log_a'.
+        formula_kwargs = {k: prefill[k] for k in ("log_a", "a", "b") if k in prefill}
         return SkipSoftmaxConfig(
-            formula=SkipSoftmaxFormula(log_a=prefill["log_a"], b=prefill["b"]),
+            formula=SkipSoftmaxFormula(**formula_kwargs),
             layer_overrides=layer_overrides,
         )
 

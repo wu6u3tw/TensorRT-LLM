@@ -16,6 +16,37 @@ from tensorrt_llm._torch.visual_gen.config import (
 )
 
 # =============================================================================
+# SkipSoftmaxFormula — accepts both log_a (diffusion) and a (LLM) formats
+# =============================================================================
+
+
+class TestSkipSoftmaxFormulaFormats:
+    def test_accepts_log_a(self):
+        """Diffusion format: log_a stored directly."""
+        f = SkipSoftmaxFormula(log_a=-14.409, b=37.457)
+        assert f.log_a == pytest.approx(-14.409)
+        assert f.b == pytest.approx(37.457)
+
+    def test_accepts_linear_a_and_normalizes(self):
+        """LLM format: a is normalized to log_a = log(a)."""
+        f = SkipSoftmaxFormula(a=7e-5, b=7.929109)
+        assert f.log_a == pytest.approx(math.log(7e-5))
+        assert f.b == pytest.approx(7.929109)
+
+    def test_rejects_both_log_a_and_a(self):
+        """Specifying both is ambiguous — error rather than silently pick one."""
+        with pytest.raises(ValueError, match="not both"):
+            SkipSoftmaxFormula(log_a=-10.0, a=999.0, b=5.0)
+
+    def test_rejects_non_positive_a(self):
+        """Linear 'a' must be positive (log of 0/negative is undefined)."""
+        with pytest.raises(ValueError, match="must be positive"):
+            SkipSoftmaxFormula(a=0.0, b=5.0)
+        with pytest.raises(ValueError, match="must be positive"):
+            SkipSoftmaxFormula(a=-1.0, b=5.0)
+
+
+# =============================================================================
 # SkipSoftmaxConfig construction
 # =============================================================================
 
@@ -251,6 +282,29 @@ config_groups:
         assert cfg.layer_overrides["blocks.0.attn2"] == 0
         assert cfg.layer_overrides["blocks.39.attn2"] == 0
         assert len(cfg.layer_overrides) == 3
+
+    def test_load_modelopt_yaml_llm_format_a(self, tmp_path):
+        """Load from LLM-format YAML where prefill uses 'a' instead of 'log_a'."""
+        from tensorrt_llm._torch.visual_gen.config import load_sparse_config_from_yaml
+
+        yaml_content = """
+config_groups:
+  group_0:
+    sparse_algo: softmax_skip
+    threshold_scale_factor:
+      formula: a * exp(b * target_sparsity)
+      prefill:
+        a: 7.0e-5
+        b: 7.929109
+"""
+        yaml_file = tmp_path / "sparse.yaml"
+        yaml_file.write_text(yaml_content)
+
+        cfg = load_sparse_config_from_yaml(str(yaml_file))
+        assert cfg is not None
+        # 'a' should be normalized to log_a = log(a)
+        assert cfg.formula.log_a == pytest.approx(math.log(7e-5))
+        assert cfg.formula.b == pytest.approx(7.929109)
 
     def test_load_yaml_no_skip_softmax(self, tmp_path):
         """YAML without softmax_skip algo returns None."""
