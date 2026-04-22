@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic import Field as PydanticField
 
 from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -59,9 +60,6 @@ class SageAttentionConfig(StrictBaseModel):
     scaling factors, enabling faster attention kernels. Providing this config
     to AttentionConfig enables SageAttention; omitting it (None) disables it.
 
-    Similar to ``sparse_attention_config`` for the base TRTLLM attention
-    backend — the presence of the config object signals enablement.
-
     Currently these (num_elts_per_blk_q, num_elts_per_blk_k, num_elts_per_blk_v)
     combinations are enabled:
     - (1, 1, 1)
@@ -80,40 +78,6 @@ class SageAttentionConfig(StrictBaseModel):
     )
     qk_int8: bool = PydanticField(True, description="Use INT8 (vs E4M3) for Q/K quantization")
 
-
-class BaseSparseAttentionConfig(StrictBaseModel):
-    """Base class for sparse attention configurations.
-
-    Subclasses must set ``algorithm`` to a unique literal string.
-    The ``algorithm`` field acts as a Pydantic discriminator so that
-    users can write ``sparse_attention_config: {algorithm: skip_softmax, ...}``
-    and the correct subclass is instantiated automatically.
-    """
-
-    algorithm: str = PydanticField(description="Sparse attention algorithm name")
-    layer_overrides: Optional[Dict[str, float]] = PydanticField(
-        None,
-        description="Per-layer threshold/parameter overrides. Keys are fnmatch "
-        "patterns matched against module names. Set to 0 to disable for "
-        "matching layers. Example: {'transformer_blocks.0.*': 0}",
-    )
-
-    def resolve_threshold(self, module_name: str) -> Optional[float]:
-        """Resolve the threshold for a specific layer by module name.
-
-        Subclasses should set ``self.threshold_scale_factor`` before calling.
-        Checks layer_overrides patterns first (fnmatch), falls back to default.
-        Returns None if threshold is 0 (disabled for this layer).
-        """
-        threshold = getattr(self, "threshold_scale_factor", None)
-        if threshold is None:
-            return None
-        if self.layer_overrides:
-            for pattern, override in self.layer_overrides.items():
-                if fnmatch.fnmatch(module_name, pattern):
-                    threshold = override
-                    break
-        return threshold if threshold > 0 else None
 
 
 class SkipSoftmaxFormula(StrictBaseModel):
@@ -151,32 +115,30 @@ class SkipSoftmaxFormula(StrictBaseModel):
         return values
 
 
-class SkipSoftmaxConfig(BaseSparseAttentionConfig):
-    """SkipSoftmax sparse attention configuration.
+class SkipSoftmaxConfig(SkipSoftmaxAttentionConfig):
+    """SkipSoftmax sparse attention configuration for visual generation.
 
-    Dynamically skips softmax + BMM2 for KV blocks whose contribution falls
-    below a threshold. The kernel decision rule is:
-        skip if exp(local_max - global_max) < threshold_scale_factor / seq_len
+    Extends the shared :class:`SkipSoftmaxAttentionConfig` from
+    ``tensorrt_llm.llmapi.llm_args`` (used by the LLM backend) with two
+    visual-gen-only concerns:
 
-    Requires backend='TRTLLM'. See docs/source/features/sparse-attention.md.
+    - ``layer_overrides``: fnmatch patterns → per-layer threshold overrides.
+    - ``formula``: a :class:`SkipSoftmaxFormula` (dual-format ``log_a``/``a``)
+      used to resolve ``target_sparsity`` into a concrete threshold in
+      log-space ``threshold = exp(log_a + b * sparsity)`` (diffusion convention).
 
     Two ways to specify the threshold:
-    1. threshold_scale_factor: raw value, resolution-dependent
-    2. target_sparsity + formula: resolution-aware, uses exp(log_a + b * sparsity)
-       Formula coefficients can come from checkpoint/YAML or user config.
+
+    1. ``threshold_scale_factor`` — raw value, resolution-dependent.
+    2. ``target_sparsity`` + ``formula`` — resolution-aware; formula coefficients
+       come from checkpoint config.json or user config.
     """
 
-    algorithm: Literal["skip_softmax"] = "skip_softmax"
-    threshold_scale_factor: Optional[float] = PydanticField(
+    layer_overrides: Optional[Dict[str, float]] = PydanticField(
         None,
-        description="Default threshold scale factor for all attention layers. "
-        "Higher = more aggressive skipping. Takes precedence over target_sparsity.",
-    )
-    target_sparsity: Optional[float] = PydanticField(
-        None,
-        description="Target sparsity (0.0-1.0). Converted to threshold_scale_factor "
-        "via calibration formula. Requires formula coefficients from checkpoint "
-        "config.json or from the 'formula' field.",
+        description="Per-layer threshold overrides. Keys are fnmatch patterns "
+        "matched against module names. Value 0 disables skip_softmax for matching "
+        "layers. Example: {'transformer_blocks.0.*': 0}",
     )
     formula: Optional[SkipSoftmaxFormula] = PydanticField(
         None,
@@ -185,25 +147,44 @@ class SkipSoftmaxConfig(BaseSparseAttentionConfig):
         "config.json formula.",
     )
 
+    def resolve_threshold(self, module_name: str) -> Optional[float]:
+        """Resolve the threshold for a specific layer by module name.
+
+        Checks ``layer_overrides`` patterns first (fnmatch), falls back to
+        ``threshold_scale_factor``. Returns ``None`` if threshold is 0 or absent.
+        """
+        threshold = self.threshold_scale_factor_prefill
+        if threshold is None:
+            return None
+        if self.layer_overrides:
+            for pattern, override in self.layer_overrides.items():
+                if fnmatch.fnmatch(module_name, pattern):
+                    threshold = override
+                    break
+        return threshold if threshold > 0 else None
+
     def resolve_threshold_scale_factor(
         self,
         checkpoint_formula: Optional[Dict[str, float]] = None,
     ) -> Optional[float]:
-        """Resolve to a concrete threshold_scale_factor.
+        """Resolve to a concrete threshold_scale_factor for the prefill phase.
 
         Priority:
-        1. self.threshold_scale_factor (if set, use directly)
-        2. self.target_sparsity + formula from:
-           a. self.formula (user config — highest precedence)
-           b. checkpoint_formula (from checkpoint config.json — fallback)
+
+        1. ``self.threshold_scale_factor`` (if set, use prefill value directly).
+        2. ``self.target_sparsity`` + formula from:
+
+           a. ``self.formula`` (user config — highest precedence).
+           b. ``checkpoint_formula`` (from checkpoint config.json — fallback).
 
         Returns:
-            Resolved threshold_scale_factor, or None if cannot resolve.
+            Resolved threshold_scale_factor, or ``None`` if cannot resolve.
         """
-        if self.threshold_scale_factor is not None:
-            return self.threshold_scale_factor
+        if self.threshold_scale_factor_prefill is not None:
+            return self.threshold_scale_factor_prefill
 
-        if self.target_sparsity is None:
+        sparsity = self.target_sparsity_prefill
+        if sparsity is None:
             return None
 
         # User formula takes precedence over checkpoint formula
@@ -227,7 +208,7 @@ class SkipSoftmaxConfig(BaseSparseAttentionConfig):
                 "coefficients. Provide via ModelOpt YAML (log_a, b), checkpoint "
                 "config.json (a, b), or user config (formula field)."
             )
-        return math.exp(log_a + b * self.target_sparsity)
+        return math.exp(log_a + b * sparsity)
 
 
 # Discriminated union of all sparse attention configs.
@@ -244,7 +225,6 @@ class AttentionConfig(StrictBaseModel):
     backend: Literal["VANILLA", "TRTLLM", "FA4"] = PydanticField(
         "VANILLA", description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4"
     )
-<<<<<<< HEAD
     sage_attention_config: Optional[SageAttentionConfig] = PydanticField(
         None,
         description=(

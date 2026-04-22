@@ -9,11 +9,11 @@ import pytest
 
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
-    BaseSparseAttentionConfig,
     SkipSoftmaxConfig,
     SkipSoftmaxFormula,
     apply_skip_softmax_overrides,
 )
+from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 
 # =============================================================================
 # SkipSoftmaxFormula — accepts both log_a (diffusion) and a (LLM) formats
@@ -119,7 +119,8 @@ class TestSkipSoftmaxConfigConstruction:
 
     def test_base_class_inheritance(self):
         cfg = SkipSoftmaxConfig(threshold_scale_factor=5000.0)
-        assert isinstance(cfg, BaseSparseAttentionConfig)
+        # Inherits from the LLM-shared SkipSoftmaxAttentionConfig (reuse, no duplication)
+        assert isinstance(cfg, SkipSoftmaxAttentionConfig)
         assert cfg.algorithm == "skip_softmax"
 
 
