@@ -39,8 +39,7 @@ import torch.nn.functional as F
 try:
     from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention
     from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
-    from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
-    from tensorrt_llm._utils import get_free_port
+    from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state    from tensorrt_llm._torch.visual_gen.config import SageAttentionConfig    from tensorrt_llm._utils import get_free_port
 
     MODULES_AVAILABLE = True
     ATTENTION_META_DICT = threading.local()
@@ -137,8 +136,12 @@ def _logic_sage_ulysses_forward(rank, world_size, *, sage_attn_qk_int8: bool):
         sage_attn_num_elts_per_blk_k=blk_k,
         sage_attn_num_elts_per_blk_v=1,
         sage_attn_qk_int8=sage_attn_qk_int8,
-        attention_metadata_state=ATTENTION_META_DICT.metadata,
-    )
+        attention_metadata_state=ATTENTION_META_DICT.metadata,        sage_attention_config=SageAttentionConfig(
+            num_elts_per_blk_q=1,
+            num_elts_per_blk_k=blk_k,
+            num_elts_per_blk_v=1,
+            qk_int8=sage_attn_qk_int8,
+        ),    )
     attention = UlyssesAttention(inner_backend=inner, process_group=None)
 
     q = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device, dtype=torch.bfloat16)
@@ -194,8 +197,12 @@ def _logic_sage_ulysses_vs_reference(
         sage_attn_num_elts_per_blk_k=sage_attn_num_elts_per_blk_k,
         sage_attn_num_elts_per_blk_v=1,
         sage_attn_qk_int8=sage_attn_qk_int8,
-        attention_metadata_state=ATTENTION_META_DICT.metadata,
-    )
+        attention_metadata_state=ATTENTION_META_DICT.metadata,        sage_attention_config=SageAttentionConfig(
+            num_elts_per_blk_q=1,
+            num_elts_per_blk_k=sage_attn_num_elts_per_blk_k,
+            num_elts_per_blk_v=1,
+            qk_int8=sage_attn_qk_int8,
+        ),    )
     attention = UlyssesAttention(inner_backend=inner, process_group=None)
 
     # Output shape: [B, S/P, H, D]
