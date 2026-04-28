@@ -333,13 +333,19 @@ class Attention(nn.Module):
 
         seq_len = q.shape[1]
         seq_len_kv = k.shape[1] if k is not None else seq_len
+
+        kwargs.update(
+            {
+                "batch_size": batch_size,
+                "seq_len": seq_len,
+                "seq_len_kv": seq_len_kv,
+            }
+        )
+
         out = self.attn.forward(
             q=q,
             k=k,
             v=v,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            seq_len_kv=seq_len_kv,
             **kwargs,
         )
 
