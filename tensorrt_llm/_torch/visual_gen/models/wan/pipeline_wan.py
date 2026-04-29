@@ -395,7 +395,7 @@ class WanPipeline(BasePipeline):
             guidance_scale = 4.0 if self.is_wan22 else 5.0
 
         if self.is_wan22 and guidance_scale_2 is None:
-            guidance_scale_2 = guidance_scale  # Match HF: default to guidance_scale when unset
+            guidance_scale_2 = 3.0
 
         # Validate two-stage denoising configuration
         if guidance_scale_2 is not None and boundary_ratio is None:

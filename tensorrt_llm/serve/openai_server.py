@@ -2001,8 +2001,14 @@ class OpenAIServer:
                 data["num_inference_steps"] = int(form["num_inference_steps"])
             if "guidance_scale" in form and form["guidance_scale"]:
                 data["guidance_scale"] = float(form["guidance_scale"])
+            if "guidance_scale_2" in form and form["guidance_scale_2"]:
+                data["guidance_scale_2"] = float(form["guidance_scale_2"])
+            if "boundary_ratio" in form and form["boundary_ratio"]:
+                data["boundary_ratio"] = float(form["boundary_ratio"])
             if "guidance_rescale" in form and form["guidance_rescale"]:
                 data["guidance_rescale"] = float(form["guidance_rescale"])
+            if "num_frames" in form and form["num_frames"]:
+                data["num_frames"] = int(form["num_frames"])
             if "seed" in form and form["seed"]:
                 data["seed"] = int(form["seed"])
 

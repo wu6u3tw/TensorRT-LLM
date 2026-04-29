@@ -1388,8 +1388,29 @@ class VideoGenerationRequest(OpenAIBaseModel):
         default=None, description="Number of denoising steps.")
     guidance_scale: Optional[float] = Field(
         default=None, description="Classifier-free guidance scale.")
+    guidance_scale_2: Optional[float] = Field(
+        default=None,
+        description=(
+            "Second-stage classifier-free guidance scale (Wan 2.2 two-stage "
+            "denoising). Active when boundary_ratio is also set."))
+    boundary_ratio: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Boundary ratio in [0, 1] that switches CFG from "
+            "guidance_scale to guidance_scale_2 once the timestep crosses "
+            "boundary_ratio * num_train_timesteps. Required when "
+            "guidance_scale_2 should take effect."))
     guidance_rescale: Optional[float] = Field(
         default=None, description="Classifier-free guidance rescale.")
+    num_frames: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Explicit number of frames to generate. When set, this overrides "
+            "the implicit `int(seconds * fps)` count. Wan-family models "
+            "require frame counts of the form 4n+1 (e.g. 81)."))
     negative_prompt: Optional[str] = Field(
         default=None,
         description="Text describing what to avoid in the generated video.")
