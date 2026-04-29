@@ -91,6 +91,15 @@ class WanPipeline(BasePipeline):
                 "Use cache_backend='none' or 'cache_dit' (not 'teacache')."
             )
 
+        # MLPerf-deterministic fixed latent (lazy-loaded on first real inference).
+        # __init__ runs under MetaInitMode where torch.load triggers aten.set_ on
+        # a meta tensor and raises MetaInitException, so we only stash the path.
+        self.fixed_latent_path: Optional[str] = (
+            model_config.extra_attrs.get("fixed_latent_path")
+            if hasattr(model_config, "extra_attrs") else None
+        )
+        self.fixed_latent: Optional[torch.Tensor] = None
+
         super().__init__(model_config)
 
     def _compute_wan_timestep_embedding(self, module, timestep=None, **kwargs):
@@ -309,6 +318,7 @@ class WanPipeline(BasePipeline):
                 guidance_scale=5.0,
                 seed=42,
                 max_sequence_length=512,
+                _use_fixed_latent=False,
             )
 
     @property
@@ -355,6 +365,7 @@ class WanPipeline(BasePipeline):
         boundary_ratio: Optional[float] = None,
         seed: int = 42,
         max_sequence_length: int = 512,
+        _use_fixed_latent: bool = True,
     ):
         pipeline_start = time.time()
 
@@ -415,7 +426,20 @@ class WanPipeline(BasePipeline):
         logger.info(f"Prompt encoding completed in {time.time() - encode_start:.2f}s")
 
         # Prepare Latents
-        latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
+        if _use_fixed_latent and self.fixed_latent_path is not None:
+            if self.fixed_latent is None:
+                self.fixed_latent = torch.load(
+                    self.fixed_latent_path,
+                    map_location=self.device,
+                    weights_only=True,
+                )
+                logger.info(
+                    f"Loaded fixed latent from {self.fixed_latent_path}, "
+                    f"shape={self.fixed_latent.shape}"
+                )
+            latents = self.fixed_latent.to(device=self.device, dtype=self.dtype)
+        else:
+            latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
         logger.debug(f"Latents shape: {latents.shape}")
 
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
