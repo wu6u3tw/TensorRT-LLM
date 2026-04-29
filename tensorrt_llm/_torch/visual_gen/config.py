@@ -51,7 +51,7 @@ class PipelineComponent(str, Enum):
 # =============================================================================
 
 
-class SageAttentionConfig(BaseModel):
+class SageAttentionConfig(StrictBaseModel):
     """Configuration for SageAttention quantization (TRTLLM backend only).
 
     SageAttention quantizes Q/K/V into FP8 (or INT8 for Q/K) with per-block
@@ -118,10 +118,7 @@ class AttentionConfig(StrictBaseModel):
                 self.sage_attention_config.num_elts_per_blk_v,
                 self.sage_attention_config.qk_int8,
             ) not in SUPPORTED_SAGE_CONFIGS:
-                raise ValueError(
-                    f"Unsupported {self.sage_attention_config=}."
-                    " Fallback to non-SageAttention TRTLLM attention"
-                )
+                raise ValueError(f"Unsupported {self.sage_attention_config=}.")
         return self
 
 

@@ -297,6 +297,8 @@ class Attention(nn.Module):
         backend_layout = getattr(self.attn, "preferred_layout", AttentionTensorLayout.NHD)
 
         batch_size = q.shape[0]
+        seq_len = q.shape[1]
+        seq_len_kv = k.shape[1] if k is not None else seq_len
 
         # Reshape inputs: [B, S, H*D] -> backend's preferred 4D layout
         if backend_layout == AttentionTensorLayout.HND:
@@ -307,9 +309,6 @@ class Attention(nn.Module):
             q = q.view(batch_size, -1, self.num_attention_heads, self.head_dim)
             k = k.view(batch_size, -1, self.num_key_value_heads, self.head_dim)
             v = v.view(batch_size, -1, self.num_key_value_heads, self.head_dim)
-
-        seq_len = q.shape[1]
-        seq_len_kv = k.shape[1] if k is not None else seq_len
 
         kwargs.update(
             {
