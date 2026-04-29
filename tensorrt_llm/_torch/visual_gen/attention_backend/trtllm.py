@@ -161,14 +161,10 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     TRTLLM Attention wrapper for diffusion models.
 
     Handles:
+    - Fused QKV requirement for TRTLLM kernel (when sage params are not provided)
     - Metadata creation and preparation
     - No KV cache operation
-
-    Two dispatch paths controlled by ``sage_attention_config``:
-    - Standard (None): fuses Q/K/V into a single QKV tensor before calling
-      the base kernel (``is_fused_qkv=True``).
-    - SageAttention (non-None): passes separate Q/K/V with per-block
-      quantization parameters (``is_fused_qkv=False``).
+    - SageAttention per-block QKV quantization (when sage params are provided. requires unfused QKV)
     """
 
     def __init__(

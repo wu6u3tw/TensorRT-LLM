@@ -286,7 +286,7 @@ python visual_gen_ltx2.py \
 | `--enable_teacache` | ✓ | ✓ | — | False | Cache optimization |
 | `--teacache_thresh` | ✓ | ✓ | — | 0.2 | TeaCache similarity threshold |
 | `--attention_backend` | ✓ | ✓ | — | VANILLA | `VANILLA`, `TRTLLM`, or `FA4` |
-| `--enable_sage_attention` | — | ✓ | — | False | SageAttention (requires `TRTLLM` attention backend) |
+| `--enable_sage_attention` | ✓ | ✓ | — | False | SageAttention (requires `TRTLLM` attention backend) |
 | `--cfg_size` | — | ✓ | — | 1 | CFG parallelism |
 | `--ulysses_size` | ✓ | ✓ | — | 1 | Ulysses parallelism |
 | `--attn2d_row_size` | ✓ | ✓ | ✓ | 1 | Attention2D mesh row size |
