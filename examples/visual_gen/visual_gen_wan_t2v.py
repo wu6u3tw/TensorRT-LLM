@@ -229,6 +229,7 @@ def parse_args():
         "Can be set independently of --attn2d_row_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
         "Cannot be combined with --ulysses_size (not yet implemented).",
     )
+    parser.add_argument("--ring_size", type=int, default=1, help="Ring parallel size")
     parser.add_argument("--disable_parallel_vae", action="store_true", help="Disable parallel VAE")
 
     # CUDA graph
@@ -305,11 +306,18 @@ def main():
     attn2d_size = args.attn2d_row_size * args.attn2d_col_size
     if attn2d_size > 1 and args.ulysses_size > 1:
         raise ValueError(
-            "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
+            "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented.")
+    
+    if args.ulysses_size > 1:
+        num_heads = 40
+        logger.info(
+            f"Using Ulysses sequence parallelism: "
+            f"{num_heads} heads / {args.ulysses_size} ranks = "
+            f"{num_heads // args.ulysses_size} heads per GPU"
         )
 
-    if args.ulysses_size > 1:
-        parallel_str = f"Ulysses(size={args.ulysses_size})"
+    if args.ulysses_size > 1 or args.ring_size > 1:
+        parallel_str = f"Ulysses(size={args.ulysses_size}), Ring(size={args.ring_size})"
     elif attn2d_size > 1:
         parallel_str = (
             f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
@@ -334,6 +342,7 @@ def main():
             "dit_ulysses_size": args.ulysses_size,
             "dit_attn2d_row_size": args.attn2d_row_size,
             "dit_attn2d_col_size": args.attn2d_col_size,
+            "dit_ring_size": args.ring_size,
             "enable_parallel_vae": not args.disable_parallel_vae,
         },
         torch_compile={
