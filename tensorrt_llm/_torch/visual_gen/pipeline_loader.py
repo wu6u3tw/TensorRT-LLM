@@ -115,7 +115,6 @@ class PipelineLoader:
                 ring_size=self.args.parallel.dit_ring_size,
                 attn2d_row_size=self.args.parallel.dit_attn2d_row_size,
                 attn2d_col_size=self.args.parallel.dit_attn2d_col_size,
-                order=self.args.parallel.dit_dim_order,
             )
         else:
             # Single-GPU fallback. no args = no parallelism.
