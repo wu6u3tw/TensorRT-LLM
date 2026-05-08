@@ -122,20 +122,23 @@ class ParallelConfig(StrictBaseModel):
     def seq_parallel_size(self) -> int:
         """Parallelism degree over the sequence/context axis.
 
-        Returns the active parallel degree: Attention2D total mesh size if enabled,
-        ring size if ring CP is enabled, otherwise Ulysses size (head-sharding).
-        Exactly one of these is active at a time; combining them is not yet implemented.
+        Returns ``cp_size × dit_ulysses_size`` where ``cp_size`` is the context-parallel
+        degree: Attention2D tile (``dit_attn2d_row_size × dit_attn2d_col_size``) if
+        Attention2D is enabled, else ``dit_ring_size`` if ring CP is enabled, else ``1``.
+        Attention2D and Ulysses can be combined (sequence × head sharding).
         """
         attn2d_size = self.dit_attn2d_row_size * self.dit_attn2d_col_size
         if attn2d_size > 1:
-            return attn2d_size
-        if self.dit_ring_size > 1:
-            return self.dit_ring_size
-        return self.dit_ulysses_size
+            cp_size = attn2d_size
+        elif self.dit_ring_size > 1:
+            cp_size = self.dit_ring_size
+        else:
+            cp_size = 1
+        return cp_size * self.dit_ulysses_size
 
     @property
     def n_workers(self) -> int:
-        return self.dit_cfg_size * self.seq_parallel_size
+        return self.dit_cfg_size * self.dit_tp_size * self.seq_parallel_size
 
     @property
     def total_parallel_size(self) -> int:

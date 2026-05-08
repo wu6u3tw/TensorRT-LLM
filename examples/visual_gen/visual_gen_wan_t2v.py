@@ -303,29 +303,18 @@ def _cache_dit_config_from_args(args) -> CacheDiTConfig:
 def main():
     args = parse_args()
 
-    attn2d_size = args.attn2d_row_size * args.attn2d_col_size
-    if attn2d_size > 1 and args.ulysses_size > 1:
-        raise ValueError(
-            "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
-        )
-
     if args.ulysses_size > 1:
         num_heads = 40
         logger.info(
-            f"Using Ulysses sequence parallelism: "
+            f"Using Ulysses head parallelism: "
             f"{num_heads} heads / {args.ulysses_size} ranks = "
             f"{num_heads // args.ulysses_size} heads per GPU"
         )
 
-    if args.ulysses_size > 1 or args.ring_size > 1:
-        parallel_str = f"Ulysses(size={args.ulysses_size}), Ring(size={args.ring_size})"
-    elif attn2d_size > 1:
-        parallel_str = (
-            f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
-            f"total={attn2d_size})"
-        )
-    else:
-        parallel_str = "None"
+    parallel_str = (
+        f"CFG(size={args.cfg_size}) + Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}) + "
+        f"Ulysses(size={args.ulysses_size}) + Ring(size={args.ring_size})"
+    )
 
     if args.enable_cache_dit:
         cache_kwargs = {"cache": _cache_dit_config_from_args(args)}

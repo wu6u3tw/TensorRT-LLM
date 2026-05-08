@@ -220,6 +220,14 @@ class TestParallelConfigValidation:
         pc = ParallelConfig()
         assert pc.seq_parallel_size == 1
 
+    def test_attn2d_and_ulysses_seq_parallel_size(self):
+        pc = ParallelConfig(
+            dit_attn2d_row_size=2,
+            dit_attn2d_col_size=2,
+            dit_ulysses_size=2,
+        )
+        assert pc.seq_parallel_size == 8
+
 
 class TestVisualGenArgsPickle:
     """VisualGenArgs must survive pickle round-trip (mp.Process spawn)."""
