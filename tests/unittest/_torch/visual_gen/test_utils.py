@@ -127,7 +127,7 @@ class TestSequenceSharderFromVgm:
         vgm = SimpleNamespace(
             seq_size=4,
             seq_rank=0,
-            seq_group=None,
+            seq_group=object(),
             ulysses_size=2,
         )
         SequenceSharder.from_vgm(vgm, num_attention_heads=8, num_kv_heads=4)
