@@ -998,5 +998,10 @@ class DiffusionModelConfig(BaseModel):
             cache=cache_cfg,
             skip_create_weights_in_init=True,
             extra_attrs=extra_attrs,
+            # Promote VAE-parallelism knobs from ParallelConfig so pipeline_loader's
+            # `if config.enable_parallel_vae` and pipeline.setup_parallel_vae's check
+            # see the user-supplied value rather than the field default.
+            enable_parallel_vae=parallel_cfg.enable_parallel_vae,
+            parallel_vae_split_dim=parallel_cfg.parallel_vae_split_dim,
             **kwargs,
         )
