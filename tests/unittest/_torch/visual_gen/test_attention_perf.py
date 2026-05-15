@@ -39,6 +39,7 @@ import torch
 # ============================================================================
 # Flash Attention 4 availability
 # ============================================================================
+from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_import_error
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
     _flash_attn_fwd_import_error as _fa4_import_error,
@@ -52,6 +53,28 @@ from tensorrt_llm._torch.visual_gen.config import (
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 
 _flash_attn4_available = _fa4_fwd is not None
+_cute_dsl_available = _cute_dsl_import_error is None
+
+
+def _require_attention_backend(backend: str) -> None:
+    if backend == "FA4" and not _flash_attn4_available:
+        pytest.fail(
+            "FlashAttention 4 backend is required for FA4 attention perf test"
+            + (f": {_fa4_import_error}" if _fa4_import_error else "")
+        )
+    if backend == "CUTEDSL" and not _cute_dsl_available:
+        pytest.fail(
+            "CuTe DSL backend is required for CUTEDSL attention perf test"
+            + (f": {_cute_dsl_import_error}" if _cute_dsl_import_error else "")
+        )
+    if backend == "CUTEDSL":
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA is required for CUTEDSL attention perf test")
+        compute_capability = torch.cuda.get_device_capability()
+        gpu_arch = f"sm_{compute_capability[0]}{compute_capability[1]}a"
+        if gpu_arch not in ("sm_100a", "sm_103a"):
+            pytest.skip("CUTEDSL attention perf test requires a supported Blackwell-class GPU")
+
 
 # NVTX support for profiling
 try:
@@ -146,6 +169,7 @@ def create_model_config(
     head_dim: int,
     eps: float = 1e-6,
     attn_backend: str = "VANILLA",
+    context_quantization_mode: str = "NO_QUANT",
     sage_attention_config: "SageAttentionConfig | None" = None,
 ) -> DiffusionModelConfig:
     """Create a mock DiffusionModelConfig for testing."""
@@ -160,6 +184,7 @@ def create_model_config(
         pretrained_config=pretrained_config,
         attention=AttentionConfig(
             backend=attn_backend,
+            context_quantization_mode=context_quantization_mode,
             sage_attention_config=sage_attention_config,
         ),
         skip_create_weights_in_init=False,
@@ -254,6 +279,7 @@ class WanAttentionPerformanceBenchmark:
         num_heads: int,
         head_dim: int,
         backend: str,
+        context_quantization_mode: str = "NO_QUANT",
         sage_attention_config: "SageAttentionConfig | None" = None,
     ) -> Attention:
         """Create a WAN self-attention model with specified backend."""
@@ -262,6 +288,7 @@ class WanAttentionPerformanceBenchmark:
             num_heads,
             head_dim,
             attn_backend=backend,
+            context_quantization_mode=context_quantization_mode,
             sage_attention_config=sage_attention_config,
         )
         model = Attention(hidden_size, num_heads, qkv_mode=QKVMode.FUSE_QKV, config=config).to(
@@ -271,10 +298,21 @@ class WanAttentionPerformanceBenchmark:
         return model
 
     def create_cross_attention_model(
-        self, hidden_size: int, num_heads: int, head_dim: int, backend: str
+        self,
+        hidden_size: int,
+        num_heads: int,
+        head_dim: int,
+        backend: str,
+        context_quantization_mode: str = "NO_QUANT",
     ) -> Attention:
         """Create a WAN cross-attention model with specified backend."""
-        config = create_model_config(hidden_size, num_heads, head_dim, attn_backend=backend)
+        config = create_model_config(
+            hidden_size,
+            num_heads,
+            head_dim,
+            attn_backend=backend,
+            context_quantization_mode=context_quantization_mode,
+        )
         model = Attention(hidden_size, num_heads, qkv_mode=QKVMode.SEPARATE_QKV, config=config).to(
             self.device
         )
@@ -312,6 +350,7 @@ class WanAttentionPerformanceBenchmark:
         seq_len_kv: int,
         head_dim: int,
         backend: str,
+        context_quantization_mode: str = "NO_QUANT",
         verbose: bool = True,
     ) -> Optional[Dict]:
         """Benchmark a single cross-attention configuration.
@@ -322,7 +361,13 @@ class WanAttentionPerformanceBenchmark:
         hidden_size = num_heads * head_dim
 
         try:
-            model = self.create_cross_attention_model(hidden_size, num_heads, head_dim, backend)
+            model = self.create_cross_attention_model(
+                hidden_size,
+                num_heads,
+                head_dim,
+                backend,
+                context_quantization_mode=context_quantization_mode,
+            )
 
             hidden_states = torch.randn(
                 batch_size, seq_len_q, hidden_size, device=self.device, dtype=self.dtype
@@ -383,8 +428,9 @@ class WanAttentionPerformanceBenchmark:
         seq_len: int,
         head_dim: int,
         backend: str,
-        verbose: bool = True,
+        context_quantization_mode: str = "NO_QUANT",
         sage_attention_config: "SageAttentionConfig | None" = None,
+        verbose: bool = True,
     ) -> Optional[Dict]:
         """Benchmark a single configuration.
 
@@ -403,7 +449,12 @@ class WanAttentionPerformanceBenchmark:
         try:
             # Create model and data
             model = self.create_attention_model(
-                hidden_size, num_heads, head_dim, backend, sage_attention_config
+                hidden_size,
+                num_heads,
+                head_dim,
+                backend,
+                context_quantization_mode=context_quantization_mode,
+                sage_attention_config=sage_attention_config,
             )
             hidden_states, freqs = self.create_test_data(batch_size, seq_len, hidden_size, head_dim)
 
@@ -465,6 +516,7 @@ class WanAttentionPerformanceBenchmark:
         seq_len: int,
         head_dim: int,
         description: str = "",
+        context_quantization_mode: str = "NO_QUANT",
         verbose: bool = True,
     ) -> Dict[str, Optional[Dict]]:
         """Benchmark and compare all backends for a given configuration."""
@@ -478,7 +530,13 @@ class WanAttentionPerformanceBenchmark:
         results = {}
         for backend in self.backends:
             results[backend] = self.benchmark_single(
-                batch_size, num_heads, seq_len, head_dim, backend, verbose
+                batch_size,
+                num_heads,
+                seq_len,
+                head_dim,
+                backend,
+                context_quantization_mode=context_quantization_mode,
+                verbose=verbose,
             )
 
         # Print comparison
@@ -635,19 +693,31 @@ class TestWanAttentionPerformance:
             benchmark_iterations=20,
         )
 
-    @pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM", "FA4"])
-    def test_self_attention_perf(self, backend: str):
+    @pytest.mark.parametrize("head_dim", [64, 128])
+    @pytest.mark.parametrize(
+        ("backend", "context_quantization_mode"),
+        [
+            ("VANILLA", "NO_QUANT"),
+            ("TRTLLM", "NO_QUANT"),
+            ("FA4", "NO_QUANT"),
+            ("CUTEDSL", "NO_QUANT"),
+            ("CUTEDSL", "QK16PV8"),
+        ],
+    )
+    def test_self_attention_perf(self, head_dim: int, backend: str, context_quantization_mode: str):
         """Test that attention backend runs without errors."""
-        if backend == "FA4" and not _flash_attn4_available:
-            pytest.fail(
-                "FlashAttention 4 backend is required for FA4 self-attention perf test"
-                + (f": {_fa4_import_error}" if _fa4_import_error else "")
-            )
+        _require_attention_backend(backend)
 
-        batch_size, num_heads, seq_len, head_dim = 1, 24, 1024, 64
+        batch_size, num_heads, seq_len = 1, 24, 1024
 
         result = self.benchmark.benchmark_single(
-            batch_size, num_heads, seq_len, head_dim, backend, verbose=True
+            batch_size,
+            num_heads,
+            seq_len,
+            head_dim,
+            backend,
+            context_quantization_mode=context_quantization_mode,
+            verbose=True,
         )
 
         assert result is not None, f"{backend} benchmark failed to produce results"
@@ -722,6 +792,7 @@ class TestFlashAttn4Performance:
             ("wan_14b_720p_81f", 1, 75600, 40, 128),  # 720x1280x81f
         ],
     )
+    @pytest.mark.parametrize("context_quantization_mode", ["NO_QUANT"])
     def test_fa4_vs_vanilla_wan_shapes(
         self,
         model_name: str,
@@ -729,6 +800,7 @@ class TestFlashAttn4Performance:
         seq_len: int,
         num_heads: int,
         head_dim: int,
+        context_quantization_mode: str,
     ):
         """Compare FA4 vs VANILLA timing on real WAN model shapes.
 
@@ -744,6 +816,7 @@ class TestFlashAttn4Performance:
             seq_len,
             head_dim,
             description=f"FA4 vs VANILLA {model_name}",
+            context_quantization_mode=context_quantization_mode,
             verbose=True,
         )
 
@@ -793,6 +866,7 @@ class TestFlashAttn4CrossAttnPerformance:
             ("wan_14b_720p_81f_cross", 1, 75600, 512, 40, 128),
         ],
     )
+    @pytest.mark.parametrize("context_quantization_mode", ["NO_QUANT"])
     def test_fa4_vs_vanilla_cross_attn_wan_shapes(
         self,
         model_name: str,
@@ -801,12 +875,20 @@ class TestFlashAttn4CrossAttnPerformance:
         seq_len_kv: int,
         num_heads: int,
         head_dim: int,
+        context_quantization_mode: str,
     ):
         """Compare FA4 vs VANILLA cross-attention on real WAN model shapes."""
         results = {}
         for backend in ["VANILLA", "FA4"]:
             results[backend] = self.benchmark.benchmark_cross_attn_single(
-                batch, num_heads, seq_len_q, seq_len_kv, head_dim, backend, verbose=True
+                batch,
+                num_heads,
+                seq_len_q,
+                seq_len_kv,
+                head_dim,
+                backend,
+                context_quantization_mode=context_quantization_mode,
+                verbose=True,
             )
 
         vanilla = results.get("VANILLA")
@@ -831,6 +913,7 @@ class TestFlashAttn4CrossAttnPerformance:
             (2, 1024, 512, 12, 128),
         ],
     )
+    @pytest.mark.parametrize("context_quantization_mode", ["NO_QUANT"])
     def test_fa4_cross_attn_quick(
         self,
         batch: int,
@@ -838,11 +921,19 @@ class TestFlashAttn4CrossAttnPerformance:
         seq_len_kv: int,
         num_heads: int,
         head_dim: int,
+        context_quantization_mode: str,
     ):
         """Quick FA4 cross-attention correctness and timing check."""
         for backend in ["VANILLA", "FA4"]:
             result = self.benchmark.benchmark_cross_attn_single(
-                batch, num_heads, seq_len_q, seq_len_kv, head_dim, backend, verbose=True
+                batch,
+                num_heads,
+                seq_len_q,
+                seq_len_kv,
+                head_dim,
+                backend,
+                context_quantization_mode=context_quantization_mode,
+                verbose=True,
             )
             assert result is not None, f"{backend} cross-attn failed"
             assert result["avg_ms"] > 0
@@ -931,8 +1022,9 @@ class TestSageAttentionPerformance:
             seq_len,
             head_dim,
             backend="TRTLLM",
-            verbose=verbose,
+            context_quantization_mode="SAGE",
             sage_attention_config=sage_cfg,
+            verbose=verbose,
         )
 
     # ------------------------------------------------------------------
