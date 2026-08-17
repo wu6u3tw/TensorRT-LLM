@@ -143,7 +143,9 @@ def test_forward_with_lse_consistent_with_forward(make_te_attn):
     with torch.no_grad():
         out_fwd = attn.forward(q, k, v)
         out_lse, lse = attn.forward_with_lse(q, k, v)
-    assert torch.allclose(out_fwd, out_lse, atol=1e-3), "forward and forward_with_lse outputs differ"
+    assert torch.allclose(out_fwd, out_lse, atol=1e-3), (
+        "forward and forward_with_lse outputs differ"
+    )
     assert torch.isfinite(lse).all(), "LSE contains NaN or Inf"
 
 
