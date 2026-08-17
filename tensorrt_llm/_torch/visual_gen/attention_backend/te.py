@@ -19,12 +19,13 @@ Uses TransformerEngine's ``DotProductAttention`` under ``fp8_autocast`` with
 ([B, S, H, D]) which maps directly to TE's ``qkv_format="bshd"`` -- no
 transpose overhead.
 
-``forward`` is decorated with ``@torch.compiler.disable`` because TE FP8
-modules graph-break under torch.compile.
+``forward`` and ``forward_with_lse`` are decorated with
+``@torch.compiler.disable`` because TE FP8 modules graph-break under
+torch.compile.
 """
 
 import math
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import torch
 
@@ -46,6 +47,9 @@ class TEAttention(AttentionBackend):
     FP8 is always enabled -- this backend exists to get FP8 attention.
     No KV cache: diffusion models recompute attention each denoising step.
     For BF16 attention use ``VANILLA``.
+
+    Supports ``forward_with_lse`` via ``return_softmax_stats=True``, enabling
+    use with Attention2DAttention for x72 context parallelism.
     """
 
     def __init__(
@@ -88,6 +92,21 @@ class TEAttention(AttentionBackend):
             self._traits = traits
         return self._attn_op
 
+    def _parse_inputs(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        attention_mask: PredefinedAttentionMask,
+        key_padding_mask: Optional[torch.Tensor],
+    ) -> Tuple[Optional[int], str]:
+        if key_padding_mask is not None:
+            raise NotImplementedError("TE attention backend does not yet support key_padding_mask.")
+        is_causal = attention_mask == PredefinedAttentionMask.CAUSAL
+        enable_gqa = self.num_heads != self.num_kv_heads
+        num_gqa_groups = k.shape[-2] if enable_gqa else None
+        attn_mask_type = "causal" if is_causal else "no_mask"
+        return num_gqa_groups, attn_mask_type
+
     @torch.compiler.disable
     def forward(
         self,
@@ -100,19 +119,40 @@ class TEAttention(AttentionBackend):
         **kwargs,
     ) -> torch.Tensor:
         """FP8 self/cross attention. q/k/v shape: [B, S, H, D]. Returns [B, S, H, D]."""
-        if key_padding_mask is not None:
-            raise NotImplementedError("TE attention backend does not yet support key_padding_mask.")
-
-        is_causal = attention_mask == PredefinedAttentionMask.CAUSAL
-        enable_gqa = self.num_heads != self.num_kv_heads
-        num_gqa_groups = k.shape[-2] if enable_gqa else None
-        attn_mask_type = "causal" if is_causal else "no_mask"
-
+        num_gqa_groups, attn_mask_type = self._parse_inputs(q, k, attention_mask, key_padding_mask)
         attn_op = self._get_attn_op(num_gqa_groups, attn_mask_type)
         with fp8_autocast(enabled=True, fp8_recipe=self.recipe):
             # TE returns [B, S, H*D]; restore to [B, S, H, D].
             out = attn_op(q, k, v, attention_mask=None)
         return out.unflatten(-1, (self.num_heads, self.head_dim))
+
+    @torch.compiler.disable
+    def forward_with_lse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """FP8 attention returning output and log-sum-exp. Required for Attention2D.
+
+        Returns:
+            output: [B, S, H, D]
+            lse:    [B, H, S] float32 -- log-sum-exp per query position
+        """
+        num_gqa_groups, attn_mask_type = self._parse_inputs(q, k, attention_mask, key_padding_mask)
+        attn_op = self._get_attn_op(num_gqa_groups, attn_mask_type)
+        B, S = q.shape[0], q.shape[1]
+        with fp8_autocast(enabled=True, fp8_recipe=self.recipe):
+            out, lse = attn_op(q, k, v, attention_mask=None, return_softmax_stats=True)
+        # out: [B, S, H*D] -> [B, S, H, D]
+        out = out.unflatten(-1, (self.num_heads, self.head_dim))
+        # lse: TE may return [B, H, S] or [B, H, S, 1] depending on version.
+        lse = lse.reshape(B, self.num_heads, S).float()
+        return out, lse
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:
@@ -121,3 +161,7 @@ class TEAttention(AttentionBackend):
     @classmethod
     def support_fused_qkv(cls) -> bool:
         return False
+
+    @classmethod
+    def support_lse(cls) -> bool:
+        return True

@@ -116,6 +116,37 @@ def test_key_padding_mask_raises(make_te_attn):
         attn(q, k, v, key_padding_mask=mask)
 
 
+def test_support_lse_true():
+    assert TEAttention.support_lse() is True
+
+
+def test_forward_with_lse_shapes(make_te_attn):
+    B, S, H, D = 1, 64, 4, 64
+    attn = make_te_attn(num_heads=H, head_dim=D)
+    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        out, lse = attn.forward_with_lse(q, k, v)
+    assert out.shape == (B, S, H, D)
+    assert lse.shape == (B, H, S)
+    assert lse.dtype == torch.float32
+
+
+def test_forward_with_lse_consistent_with_forward(make_te_attn):
+    B, S, H, D = 1, 64, 4, 64
+    attn = make_te_attn(num_heads=H, head_dim=D)
+    torch.manual_seed(0)
+    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        out_fwd = attn.forward(q, k, v)
+        out_lse, lse = attn.forward_with_lse(q, k, v)
+    assert torch.allclose(out_fwd, out_lse, atol=1e-3), "forward and forward_with_lse outputs differ"
+    assert torch.isfinite(lse).all(), "LSE contains NaN or Inf"
+
+
 def test_attn_op_rebuilt_on_trait_change(make_te_attn):
     attn = make_te_attn(num_heads=4, head_dim=64)
     B, S = 1, 64
