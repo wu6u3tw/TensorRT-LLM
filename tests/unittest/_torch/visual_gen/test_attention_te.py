@@ -149,6 +149,44 @@ def test_forward_with_lse_consistent_with_forward(make_te_attn):
     assert torch.isfinite(lse).all(), "LSE contains NaN or Inf"
 
 
+def test_forward_with_lse_values(make_te_attn):
+    """LSE from TE must satisfy the softmax partition property: exp(scores - LSE) sums to 1.
+
+    This is the contract Attention2DAttention relies on when combining partial
+    attention results across context-parallel ranks.
+    """
+    B, S, H, D = 1, 64, 4, 64
+    attn = make_te_attn(num_heads=H, head_dim=D)
+    torch.manual_seed(42)
+    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    scale = 1.0 / (D ** 0.5)
+
+    with torch.no_grad():
+        _, lse = attn.forward_with_lse(q, k, v)  # lse: [B, H, S] float32
+
+        # Reference LSE from BF16 scores.
+        scores = torch.matmul(
+            q.transpose(1, 2).float(),
+            k.transpose(1, 2).float().transpose(-1, -2),
+        ) * scale  # [B, H, S, S]
+        lse_ref = torch.logsumexp(scores, dim=-1)  # [B, H, S]
+
+    # 1. LSE values align with BF16 reference (FP8 introduces small error).
+    cos_sim = torch.nn.functional.cosine_similarity(
+        lse.reshape(-1), lse_ref.reshape(-1), dim=0
+    ).item()
+    assert cos_sim > 0.99, f"LSE cosine similarity {cos_sim:.4f} < 0.99"
+
+    # 2. Partition property: softmax rows reconstructed from TE's LSE sum to ~1.
+    #    This is exactly the property Attention2D uses when merging shards.
+    row_sums = torch.exp(scores - lse.unsqueeze(-1)).sum(-1)  # [B, H, S]
+    assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=0.05), (
+        f"Softmax row sums deviate: max={row_sums.max():.3f} min={row_sums.min():.3f}"
+    )
+
+
 def test_attn_op_rebuilt_on_trait_change(make_te_attn):
     attn = make_te_attn(num_heads=4, head_dim=64)
     B, S = 1, 64
