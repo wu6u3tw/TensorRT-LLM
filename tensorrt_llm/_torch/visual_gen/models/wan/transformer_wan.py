@@ -25,6 +25,46 @@ from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeig
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
+
+
+def _mlperf_fp8_patterns():
+    """MLPERF MIXED-FORMAT PATCH: module patterns forced to FP8, from env.
+
+    JSON list of strings, same syntax as QuantConfig.exclude_modules
+    ('re:'-prefixed regex or fnmatch glob). Empty/unset disables the hook so
+    this file behaves exactly like upstream.
+    """
+    import json
+    import os
+
+    raw = os.environ.get("TRTLLM_VISUAL_GEN_FP8_PATTERNS", "").strip()
+    if not raw:
+        return []
+    patterns = json.loads(raw)
+    if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
+        raise ValueError(
+            f"TRTLLM_VISUAL_GEN_FP8_PATTERNS must be a JSON list of strings, got: {raw!r}"
+        )
+    return patterns
+
+
+def _mlperf_pattern_match(patterns, name):
+    """Mirror of QuantConfig.is_module_excluded_from_quantization matching."""
+    import fnmatch
+    import re
+
+    candidate = name
+    while True:
+        for pattern in patterns:
+            if pattern.startswith("re:"):
+                if re.fullmatch(pattern[3:], candidate):
+                    return True
+            elif fnmatch.fnmatchcase(candidate, pattern):
+                return True
+        if "." not in candidate:
+            return False
+        candidate = candidate.rsplit(".", 1)[0]
 
 try:
     # Available in transformers<5
@@ -777,17 +817,47 @@ class WanTransformer3DModel(BaseDiffusionModel):
 
     def apply_quant_config_exclude_modules(self):
         quant_config = self.model_config.quant_config
-        if quant_config is None or quant_config.exclude_modules is None:
+        if quant_config is None:
             return
 
         kv_cache_quant_algo = quant_config.kv_cache_quant_algo if quant_config else None
         no_quant_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
 
+        # MLPERF MIXED-FORMAT PATCH (not upstream). Upstream carries one global
+        # quant_algo plus an exclude list; per-layer formats are hardcoded off
+        # (config.py: `layer_quant_config = None`). Modules matching
+        # TRTLLM_VISUAL_GEN_FP8_PATTERNS get FP8 instead of the global algo.
+        # Precedence: `ignore` (-> no quant) wins over the FP8 patterns.
+        fp8_patterns = _mlperf_fp8_patterns()
+        fp8_quant_config = (
+            QuantConfig(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=kv_cache_quant_algo)
+            if fp8_patterns
+            else None
+        )
+        per_layer_quant = {}
+
         for name, module in self.named_modules():
             if isinstance(module, Linear):
-                is_excluded = quant_config.is_module_excluded_from_quantization(name)
-                if is_excluded and getattr(module, "quant_config", None) is not None:
+                if getattr(module, "quant_config", None) is None:
+                    continue
+                is_excluded = (
+                    quant_config.exclude_modules is not None
+                    and quant_config.is_module_excluded_from_quantization(name)
+                )
+                if is_excluded:
                     module.quant_config = no_quant_config
+                elif fp8_quant_config is not None and _mlperf_pattern_match(fp8_patterns, name):
+                    module.quant_config = fp8_quant_config
+                    per_layer_quant[name] = fp8_quant_config
+
+        if per_layer_quant:
+            # Consumed by DynamicLinearWeightLoader._get_quant_algo_for_layer, which
+            # is built in load_weights() after __init__, so this assignment is visible.
+            self.model_config.quant_config_dict = per_layer_quant
+            logger.info(
+                f"[MLPerf mixed-format] {len(per_layer_quant)} Linear modules -> FP8, "
+                f"remainder -> {quant_config.quant_algo}"
+            )
 
     def unpatchify(self, x, original_shape):
         N, C, T, H, W = original_shape
