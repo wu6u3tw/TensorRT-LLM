@@ -424,9 +424,9 @@ def fp8_self_attention_ulysses(qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps
     q8, k8, v8 = norm_rope_quant_fp8(
         qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps, interleave, 1.0 / scale_v
     )
-    # Sequence-sharded to head-sharded, exchanged as FP8 bytes.
+    # Sequence-sharded to head-sharded, FP8 moved as int64 words for wide copies.
     q8, k8, v8 = (
-        all_to_all_4d(t.view(torch.uint8), scatter_dim=2, gather_dim=1, process_group=pg).view(FP8)
+        all_to_all_4d(t.view(torch.int64), scatter_dim=2, gather_dim=1, process_group=pg).view(FP8)
         for t in (q8, k8, v8)
     )
     out = fmha_fp8(q8, k8, v8, scale_v)
