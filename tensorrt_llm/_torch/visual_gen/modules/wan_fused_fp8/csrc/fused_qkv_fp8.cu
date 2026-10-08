@@ -848,6 +848,48 @@ void dispatchNrqFast(int nch, int tokens, int H, cudaStream_t stream, __nv_bfloa
 #undef NRQ_CASE
 }
 
+// Merges N partial outputs by LSE; stats are float2 {max, sum}, one warp per row-head.
+template <int N>
+__global__ void lseCombineKernel(
+    __nv_bfloat16 const* o, float2 const* stats, __nv_bfloat16* out, int64_t rowsHeads, int64_t partStride)
+{
+    int64_t const rh = blockIdx.x * (int64_t) (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (rh >= rowsHeads)
+        return;
+    int const lane = threadIdx.x & 31;
+    float lse[N];
+    float m = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < N; i++)
+    {
+        float2 const st = stats[i * partStride + rh];
+        lse[i] = st.x + logf(st.y);
+        m = fmaxf(m, lse[i]);
+    }
+    float denom = 0.f;
+#pragma unroll
+    for (int i = 0; i < N; i++)
+    {
+        lse[i] = expf(lse[i] - m);
+        denom += lse[i];
+    }
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int i = 0; i < N; i++)
+    {
+        uint2 const v = *reinterpret_cast<uint2 const*>(o + (i * partStride + rh) * 128 + lane * 4);
+        __nv_bfloat162 const* h = reinterpret_cast<__nv_bfloat162 const*>(&v);
+        float2 const a = __bfloat1622float2(h[0]), b = __bfloat1622float2(h[1]);
+        float const w = lse[i] / denom;
+        acc[0] += w * a.x;
+        acc[1] += w * a.y;
+        acc[2] += w * b.x;
+        acc[3] += w * b.y;
+    }
+    __nv_bfloat162 res[2] = {__floats2bfloat162_rn(acc[0], acc[1]), __floats2bfloat162_rn(acc[2], acc[3])};
+    *reinterpret_cast<uint2*>(out + rh * 128 + lane * 4) = *reinterpret_cast<uint2 const*>(res);
+}
+
 // qkv [T, 3*H*D] bf16 to q8/k8/v8 [T, H*D] fp8.
 void norm_rope_quant(torch::Tensor qkv, int64_t num_heads, double eps, torch::Tensor q_weight, torch::Tensor k_weight,
     torch::Tensor cos_emb, torch::Tensor sin_emb, bool interleave, int64_t cos_seq_per_batch, torch::Tensor quant_mul,
@@ -945,8 +987,35 @@ void v_scale(torch::Tensor qkv, int64_t num_heads, torch::Tensor amax_v, torch::
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// o [N, R, H, 128] bf16, stats [N, R, H, 2] f32 to out [R, H, 128] bf16.
+void lse_combine(torch::Tensor o, torch::Tensor stats, torch::Tensor out)
+{
+    TORCH_CHECK(o.is_contiguous() && stats.is_contiguous() && out.is_contiguous(), "contiguous inputs only");
+    TORCH_CHECK(o.scalar_type() == at::kBFloat16 && stats.scalar_type() == at::kFloat && o.size(-1) == 128);
+    int const n = static_cast<int>(o.size(0));
+    int64_t const rowsHeads = out.numel() / 128;
+    TORCH_CHECK(o.numel() == n * rowsHeads * 128 && stats.numel() == n * rowsHeads * 2, "shape mismatch");
+    auto stream = at::cuda::getCurrentCUDAStream(o.get_device());
+    dim3 const block(256), grid((rowsHeads + 7) / 8);
+    auto const* op = reinterpret_cast<__nv_bfloat16 const*>(o.data_ptr());
+    auto const* sp = reinterpret_cast<float2 const*>(stats.data_ptr());
+    auto* outp = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+    switch (n)
+    {
+    case 1: lseCombineKernel<1><<<grid, block, 0, stream>>>(op, sp, outp, rowsHeads, rowsHeads); break;
+    case 2: lseCombineKernel<2><<<grid, block, 0, stream>>>(op, sp, outp, rowsHeads, rowsHeads); break;
+    case 3: lseCombineKernel<3><<<grid, block, 0, stream>>>(op, sp, outp, rowsHeads, rowsHeads); break;
+    case 4: lseCombineKernel<4><<<grid, block, 0, stream>>>(op, sp, outp, rowsHeads, rowsHeads); break;
+    case 6: lseCombineKernel<6><<<grid, block, 0, stream>>>(op, sp, outp, rowsHeads, rowsHeads); break;
+    case 8: lseCombineKernel<8><<<grid, block, 0, stream>>>(op, sp, outp, rowsHeads, rowsHeads); break;
+    default: TORCH_CHECK(false, "lse_combine: unsupported partial count ", n);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("norm_rope_quant", &norm_rope_quant);
     m.def("v_scale", &v_scale);
+    m.def("lse_combine", &lse_combine);
 }

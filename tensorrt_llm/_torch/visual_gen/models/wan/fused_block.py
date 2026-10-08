@@ -91,11 +91,11 @@ def _fused_attn_mode(attn):
 
 
 def _self_attention(attn, qkv, freqs_cos, freqs_sin, timestep):
-    mode, pg = _fused_attn_mode(attn)
-    if mode == "ulysses":
-        return fused_ops.ulysses_self_attention(qkv, *_attn_args(attn, freqs_cos, freqs_sin), pg)
-    if mode == "none":
-        return torch.ops.wanfused.fp8_self_attention(qkv, *_attn_args(attn, freqs_cos, freqs_sin))
+    mode, groups = _fused_attn_mode(attn)
+    if mode != "unsupported":
+        return fused_ops.fused_self_attention(
+            mode, groups, qkv, *_attn_args(attn, freqs_cos, freqs_sin)
+        )
     attn.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
     q, k, v = qkv.split([attn.local_q_dim, attn.local_kv_dim, attn.local_kv_dim], dim=-1)
     return attn._attn_impl(q, k, v, timestep=timestep)

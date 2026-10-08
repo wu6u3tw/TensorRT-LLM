@@ -5,6 +5,7 @@
 Q/K scales fold the softmax scale, so attention runs with scaleSoftmaxLog2 == 1.
 """
 
+import math
 import os
 from typing import List, Optional
 
@@ -14,10 +15,11 @@ import torch.distributed._functional_collectives as funcol
 
 from tensorrt_llm._torch.distributed import all_to_all_4d
 
+from ...mapping import VisualGenMapping
 from . import _ext, ulysses_overlap
 from ._common import FP8, FP8_MAX, HEAD_DIM, rope_tables, shape_buffers
 
-_UNSUPPORTED_SP = ("Attention2DAttention", "RingAttention")
+_UNSUPPORTED_SP = ("RingAttention",)
 # Opt-in Ulysses comm/FMHA overlap; head groups per rank.
 _ULYSSES_OVERLAP = os.environ.get("TRTLLM_WAN_ULYSSES_OVERLAP", "0") == "1"
 _ULYSSES_GROUPS = int(os.environ.get("TRTLLM_WAN_ULYSSES_GROUPS", "2"))
@@ -289,20 +291,127 @@ def _(q8, k8, v8, scale_v):
     return q8.new_empty(batch, seq, heads * HEAD_DIM, dtype=torch.bfloat16)
 
 
+@torch.library.custom_op("wanfused::norm_rope_quant_fp8_packed", mutates_args=())
+def norm_rope_quant_fp8_packed(
+    qkv: torch.Tensor,
+    norm_q_w: torch.Tensor,
+    norm_k_w: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    num_heads: int,
+    eps: float,
+    interleave: bool,
+    mul_v: torch.Tensor,
+) -> torch.Tensor:
+    """FP8 Q/K/V packed as [3, B, S, H, D] with the given V quant multiplier."""
+    batch, seq, _ = qkv.shape
+    bufs = shape_buffers(batch, seq, qkv.device)
+    mul = torch.cat([bufs["qk_mul"], mul_v.float().reshape(1)])
+    qkv2d = qkv.reshape(batch * seq, -1).contiguous()
+    cos2d, sin2d, seq_per_batch = rope_tables(cos, sin, qkv2d.shape[0])
+    out = torch.empty(3, batch, seq, num_heads, HEAD_DIM, device=qkv.device, dtype=FP8)
+    _ext.prep().norm_rope_quant(
+        qkv2d,
+        num_heads,
+        eps,
+        norm_q_w,
+        norm_k_w,
+        cos2d,
+        sin2d,
+        interleave,
+        seq_per_batch,
+        mul,
+        bufs["amax"],
+        out[0],
+        out[1],
+        out[2],
+    )
+    return out
+
+
+@norm_rope_quant_fp8_packed.register_fake
+def _(qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps, interleave, mul_v):
+    batch, seq, _ = qkv.shape
+    return qkv.new_empty(3, batch, seq, num_heads, HEAD_DIM, dtype=FP8)
+
+
+@torch.library.custom_op("wanfused::fmha_fp8_stats", mutates_args=())
+def fmha_fp8_stats(
+    q8: torch.Tensor, k8: torch.Tensor, v8: torch.Tensor, scale_v: torch.Tensor
+) -> List[torch.Tensor]:
+    """FP8 attention of [B, Sq, H, D] over [B, Skv, H, D]; returns out and stats.
+
+    Stats are [B*Sq, H, 2] float {max, sum}; LSE = max + ln(sum) in natural log.
+    """
+    batch, seq_q, heads, _ = q8.shape
+    seq_kv = k8.shape[1]
+    bq = shape_buffers(batch, seq_q, q8.device)
+    bkv = shape_buffers(batch, seq_kv, q8.device)
+    stats = torch.empty(batch * seq_q, heads, 2, device=q8.device, dtype=torch.float32)
+    out = _ext.fmha().fmha(
+        q8.reshape(batch * seq_q, heads, HEAD_DIM),
+        k8.reshape(batch * seq_kv, heads, HEAD_DIM),
+        v8.reshape(batch * seq_kv, heads, HEAD_DIM),
+        bq["cu_seqlens"],
+        bq["seqlens"],
+        bq["bmm1"],
+        scale_v.float().reshape(1).contiguous(),
+        batch,
+        seq_q,
+        True,
+        True,
+        None,
+        softmax_stats=stats,
+        cu_seqlens_kv=bkv["cu_seqlens"],
+        seqlens_kv=bkv["seqlens"],
+        seq_len_kv=seq_kv,
+    )
+    return [out.view(batch, seq_q, heads, HEAD_DIM), stats]
+
+
+@fmha_fp8_stats.register_fake
+def _(q8, k8, v8, scale_v):
+    batch, seq_q, heads, _ = q8.shape
+    return [
+        q8.new_empty(batch, seq_q, heads, HEAD_DIM, dtype=torch.bfloat16),
+        q8.new_empty(batch * seq_q, heads, 2, dtype=torch.float32),
+    ]
+
+
+@torch.library.custom_op("wanfused::lse_combine", mutates_args=())
+def lse_combine(o: torch.Tensor, stats: torch.Tensor) -> torch.Tensor:
+    """Merge partials o [N, R, H, D] by stats [N, R, H, 2] into [R, H, D]."""
+    out = o.new_empty(o.shape[1:])
+    _ext.prep().lse_combine(o.contiguous(), stats.contiguous(), out)
+    return out
+
+
+@lse_combine.register_fake
+def _(o, stats):
+    return o.new_empty(o.shape[1:])
+
+
 def sp_mode(attn_module):
-    """Returns ("none"|"ulysses"|"unsupported", process group or None)."""
+    """Returns (mode, groups) with mode "none", "ulysses", "attn2d" or "unsupported".
+
+    groups: the Ulysses group, or (ulysses or None, row, col, amax groups) for attn2d.
+    """
     backend = getattr(attn_module, "attn", None)
-    if type(backend).__name__ in _UNSUPPORTED_SP:
+    ulysses_pg = None
+    if type(backend).__name__ == "UlyssesAttention":
+        pg = backend.process_group
+        if pg is not None and dist.get_world_size(group=pg) > 1:
+            ulysses_pg = pg
+        backend = backend.inner_backend
+    name = type(backend).__name__
+    if name in _UNSUPPORTED_SP:
         return "unsupported", None
-    if type(backend).__name__ != "UlyssesAttention":
+    if name == "Attention2DAttention":
+        row_pg, col_pg = backend.row_process_group, backend.col_process_group
+        return "attn2d", (ulysses_pg, row_pg, col_pg, _amax_groups(ulysses_pg, row_pg, col_pg))
+    if ulysses_pg is None:
         return "none", None
-    # Ulysses over Attention2D / Ring needs LSE merging: unsupported here.
-    if type(backend.inner_backend).__name__ in _UNSUPPORTED_SP:
-        return "unsupported", None
-    pg = backend.process_group
-    if pg is None or dist.get_world_size(group=pg) == 1:
-        return "none", None
-    return "ulysses", pg
+    return "ulysses", ulysses_pg
 
 
 def fp8_self_attention_ulysses(qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps, interleave, pg):
@@ -327,6 +436,108 @@ def fp8_self_attention_ulysses(qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps
     return out.reshape(batch, seq_local, num_heads * HEAD_DIM)
 
 
+def _amax_groups(ulysses_pg, row_pg, col_pg):
+    """Groups to max-reduce V amax over; the seq mesh group when it spans them."""
+    groups = tuple(
+        g
+        for g in (ulysses_pg, row_pg, col_pg)
+        if g is not None and dist.get_world_size(group=g) > 1
+    )
+    mesh = VisualGenMapping.seq_mesh
+    if len(groups) > 1 and mesh is not None:
+        seq = mesh.get_group()
+        if dist.get_world_size(group=seq) == math.prod(
+            dist.get_world_size(group=g) for g in groups
+        ):
+            return (seq,)
+    return groups
+
+
+def _all_gather_seq(tensors, pg):
+    """Gathers FP8 [B, S, H, D] tensors along S over pg, one coalesced launch."""
+    world = dist.get_world_size(group=pg)
+    outs = [t.new_empty(world, *t.shape) for t in tensors]
+    with dist._coalescing_manager(group=pg, device=tensors[0].device):
+        for out, t in zip(outs, tensors):
+            dist.all_gather_into_tensor(out.view(-1), t.contiguous().view(-1), group=pg)
+    batch, seq = tensors[0].shape[:2]
+    if batch == 1:
+        return [o.view(1, world * seq, *o.shape[3:]) for o in outs]
+    return [o.transpose(0, 1).reshape(batch, world * seq, *o.shape[3:]) for o in outs]
+
+
+def _exchange_dest_major(t, world, pg):
+    """[B, W*S, ...] split by destination rank; returns received [W, B, S, ...]."""
+    batch = t.shape[0]
+    send = t.view(batch, world, t.shape[1] // world, *t.shape[2:]).transpose(0, 1)
+    send = send.contiguous() if batch > 1 else send.reshape(world, *send.shape[1:])
+    recv = torch.empty_like(send)
+    dist.all_to_all_single(recv, send, group=pg)
+    return recv
+
+
+def fp8_self_attention_attn2d(
+    qkv,
+    norm_q_w,
+    norm_k_w,
+    cos,
+    sin,
+    num_heads,
+    eps,
+    interleave,
+    ulysses_pg,
+    row_pg,
+    col_pg,
+    amax_groups=None,
+):
+    """Attention2D, optionally inside Ulysses: local [B, S/P, 3*H*D] to [B, S/P, H*D]."""
+    batch, seq_local, _ = qkv.shape
+    if amax_groups is None:
+        amax_groups = _amax_groups(ulysses_pg, row_pg, col_pg)
+    # One V scale across all ranks whose partial outputs are merged.
+    amax = v_amax(qkv, num_heads)
+    for pg in amax_groups:
+        dist.all_reduce(amax, op=dist.ReduceOp.MAX, group=pg)
+    scale_v = amax.clamp_min(1e-12) / FP8_MAX
+    qkv8 = norm_rope_quant_fp8_packed(
+        qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps, interleave, 1.0 / scale_v
+    )
+    if ulysses_pg is not None:
+        # One all-to-all for Q/K/V; FP8 moved as int64 words for wide copies.
+        qkv8 = all_to_all_4d(
+            qkv8.view(torch.int64).view(3 * batch, seq_local, num_heads, HEAD_DIM // 8),
+            scatter_dim=2,
+            gather_dim=1,
+            process_group=ulysses_pg,
+        )
+        qkv8 = qkv8.view(FP8).view(3, batch, qkv8.shape[1], qkv8.shape[2], HEAD_DIM)
+    out = _attn2d_core(qkv8, scale_v, row_pg, col_pg)
+    if ulysses_pg is not None:
+        out = all_to_all_4d(out, scatter_dim=1, gather_dim=2, process_group=ulysses_pg)
+    return out.reshape(batch, seq_local, num_heads * HEAD_DIM)
+
+
+def _attn2d_core(qkv8, scale_v, row_pg, col_pg):
+    """Gathers, FMHA with stats and LSE reduce-scatter; [3, B, S, H, D] to [B, S, H, D]."""
+    q8, k8, v8 = qkv8.unbind(0)
+    batch, seq_u, heads = q8.shape[:3]
+    rows = dist.get_world_size(group=row_pg)
+    if rows > 1:
+        (q8,) = _all_gather_seq([q8], row_pg)
+    if dist.get_world_size(group=col_pg) > 1:
+        k8, v8 = _all_gather_seq([k8, v8], col_pg)
+    out, stats = fmha_fp8_stats(q8, k8, v8, scale_v)
+    if rows > 1:
+        # Reduce-scatter along S: exchange partials, then merge by LSE.
+        o_recv = _exchange_dest_major(out, rows, row_pg)
+        st_recv = _exchange_dest_major(stats.view(batch, rows * seq_u, heads, 2), rows, row_pg)
+        out = lse_combine(
+            o_recv.view(rows, batch * seq_u, heads, HEAD_DIM),
+            st_recv.view(rows, batch * seq_u, heads, 2),
+        )
+    return out.view(batch, seq_u, heads, HEAD_DIM)
+
+
 def ulysses_self_attention(qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps, interleave, pg):
     """Ulysses fused attention, overlapped when enabled and supported."""
     if _ULYSSES_OVERLAP and ulysses_overlap.supported(
@@ -349,6 +560,15 @@ def ulysses_self_attention(qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps, in
     )
 
 
+def fused_self_attention(mode, groups, qkv, *args):
+    """Runs the fused path for a supported sp_mode() result."""
+    if mode == "attn2d":
+        return fp8_self_attention_attn2d(qkv, *args, *groups)
+    if mode == "ulysses":
+        return ulysses_self_attention(qkv, *args, groups)
+    return fp8_self_attention(qkv, *args)
+
+
 def self_attention(
     attn,
     qkv: torch.Tensor,
@@ -357,7 +577,7 @@ def self_attention(
     timestep: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused FP8 self-attention for a packed-QKV Attention module."""
-    mode, pg = sp_mode(attn)
+    mode, groups = sp_mode(attn)
     args = (
         attn.norm_q.weight,
         attn.norm_k.weight,
@@ -367,11 +587,9 @@ def self_attention(
         float(attn.eps),
         bool(attn.interleave),
     )
-    if mode == "ulysses":
-        return ulysses_self_attention(qkv, *args, pg)
-    if mode == "none":
-        return fp8_self_attention(qkv, *args)
-    # Attention2D / Ring: use the module's own backend.
+    if mode != "unsupported":
+        return fused_self_attention(mode, groups, qkv, *args)
+    # Ring: use the module's own backend.
     attn.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
     q, k, v = qkv.split([attn.local_q_dim, attn.local_kv_dim, attn.local_kv_dim], dim=-1)
     return attn._attn_impl(q, k, v, timestep=timestep)

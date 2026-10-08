@@ -145,6 +145,78 @@ def test_fused_fp8_attention_ulysses_overlap_matches_all_to_all(batch):
     _run_distributed(2, _ulysses_overlap_logic, batch=batch, seq=2048, heads=40, groups=2)
 
 
+def _attn2d_groups(rank, world_size, parallel):
+    vgm = VisualGenMapping(world_size=world_size, rank=rank, **parallel)
+    ulysses = vgm.ulysses_group if parallel.get("ulysses_size", 1) > 1 else None
+    return ulysses, vgm.attn2d_row_group, vgm.attn2d_col_group
+
+
+def _exact_fp8_attention(qkv, norm_q_w, norm_k_w, cos, sin, heads, rows):
+    """FP32 attention over the fused path's FP8 Q/K/V for query rows."""
+    scale_v = fused_ops.v_amax(qkv, heads) / 448.0
+    q8, k8, v8 = fused_ops.norm_rope_quant_fp8(
+        qkv, norm_q_w, norm_k_w, cos, sin, heads, 1e-6, True, 1.0 / scale_v
+    )
+    # Q/K scales fold the softmax scale, so q.k is in log2 units.
+    logits = torch.einsum("bqhd,bkhd->bhqk", q8[:, rows].float(), k8.float()) * math.log(2.0)
+    out = torch.einsum("bhqk,bkhd->bqhd", logits.softmax(-1), v8.float() * scale_v)
+    return out.flatten(2)
+
+
+def _attn2d_ops_logic(rank, world_size, parallel, batch, seq, heads):
+    device = torch.device("cuda", rank)
+    dim = heads * _HEAD_DIM
+    gen = torch.Generator(device=device).manual_seed(0)
+    qkv = (torch.randn(batch, seq, 3 * dim, device=device, generator=gen) * 3).to(torch.bfloat16)
+    norm_q_w = (torch.rand(dim, device=device, generator=gen) + 0.5).to(torch.bfloat16)
+    norm_k_w = (torch.rand(dim, device=device, generator=gen) + 0.5).to(torch.bfloat16)
+    angle = torch.rand(seq, _HEAD_DIM // 2, device=device, generator=gen) * 2 * math.pi
+    cos = torch.repeat_interleave(angle.cos(), 2, dim=-1)
+    sin = torch.repeat_interleave(angle.sin(), 2, dim=-1)
+    args = (heads, 1e-6, True)
+
+    ref = torch.ops.wanfused.fp8_self_attention(qkv, norm_q_w, norm_k_w, cos, sin, *args)
+    # Any shard placement works: each rank's rows see every K/V shard once.
+    local = slice(rank * seq // world_size, (rank + 1) * seq // world_size)
+    out = fused_ops.fp8_self_attention_attn2d(
+        qkv[:, local].contiguous(),
+        norm_q_w,
+        norm_k_w,
+        cos[local].contiguous(),
+        sin[local].contiguous(),
+        *args,
+        *_attn2d_groups(rank, world_size, parallel),
+    )
+    expected = ref[:, local]
+    exact = _exact_fp8_attention(qkv, norm_q_w, norm_k_w, cos, sin, heads, local)
+    # Split KV re-rounds FP8 P per partial, so bitwise-close is not expected;
+    # require single-GPU accuracy against exact attention on the same FP8 Q/K/V.
+    assert 1 - _cosine(out, exact) <= 1.25 * (1 - _cosine(expected, exact)) + 1e-6
+    assert _cosine(out, expected) > 0.999
+    assert (out.float() - expected.float()).abs().max().item() < 0.05
+
+
+_ATTN2D_PARALLEL = [
+    dict(attn2d_row_size=1, attn2d_col_size=2),
+    dict(attn2d_row_size=2, attn2d_col_size=2),
+    dict(attn2d_row_size=1, attn2d_col_size=2, ulysses_size=2),
+]
+_ATTN2D_IDS = ["attn2d_1x2", "attn2d_2x2", "attn2d_1x2_ulysses2"]
+_needs_combine = pytest.mark.skipif(
+    parallel_backend._flash_attn_combine is None, reason="Attention2D needs flash_attn_combine."
+)
+
+
+@_needs_combine
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("parallel", _ATTN2D_PARALLEL, ids=_ATTN2D_IDS)
+def test_fused_fp8_attention_attn2d_matches_single_gpu(parallel, batch):
+    world_size = math.prod(parallel.values())
+    _run_distributed(
+        world_size, _attn2d_ops_logic, parallel=parallel, batch=batch, seq=4096, heads=40
+    )
+
+
 def _wan_model(device, backend, **parallel):
     use_dist = any(v > 1 for v in parallel.values())
     vgm = VisualGenMapping(
@@ -198,25 +270,15 @@ def test_wan_transformer_fused_attention_ulysses():
 
 def _wan_attn2d_logic(rank, world_size, parallel):
     device = torch.device("cuda", rank)
+    single = _wan_forward(_wan_model(device, "CUDNN"), device, fused=True)
     model = _wan_model(device, "CUDNN", **parallel)
-    assert fused_ops.sp_mode(model.blocks[0].attn1)[0] == "unsupported"
-    baseline = _wan_forward(model, device, fused=False)
-    fused = _wan_forward(model, device, fused=True)
-    # Attention2D must fall back to the module backend unchanged.
-    assert torch.equal(fused, baseline)
+    assert fused_ops.sp_mode(model.blocks[0].attn1)[0] == "attn2d"
+    out = _wan_forward(model, device, fused=True)
+    assert _cosine(out, single) > 0.9999
 
 
-@pytest.mark.skipif(
-    parallel_backend._flash_attn_combine is None, reason="Attention2D needs flash_attn_combine."
-)
-@pytest.mark.parametrize(
-    "parallel",
-    [
-        dict(attn2d_row_size=1, attn2d_col_size=2),
-        dict(attn2d_row_size=1, attn2d_col_size=2, ulysses_size=2),
-    ],
-    ids=["attn2d_1x2", "attn2d_1x2_ulysses2"],
-)
-def test_wan_transformer_fused_attention_attn2d_falls_back(parallel):
+@_needs_combine
+@pytest.mark.parametrize("parallel", _ATTN2D_PARALLEL, ids=_ATTN2D_IDS)
+def test_wan_transformer_fused_attention_attn2d(parallel):
     world_size = math.prod(parallel.values())
     _run_distributed(world_size, _wan_attn2d_logic, parallel=parallel)
