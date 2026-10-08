@@ -12,6 +12,7 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
+from torch.distributed.distributed_c10d import _resolve_process_group
 
 from tensorrt_llm._torch.distributed import all_to_all_4d
 
@@ -391,11 +392,23 @@ def _(o, stats):
     return o.new_empty(o.shape[1:])
 
 
+_SP_SPEC_ATTR = "_wan_fused_sp_spec"
+
+
 def sp_mode(attn_module):
     """Returns (mode, groups) with mode "none", "ulysses", "attn2d" or "unsupported".
 
-    groups: the Ulysses group, or (ulysses or None, row, col, amax groups) for attn2d.
+    groups: the Ulysses group, or (ulysses, row, col, amax groups) names for attn2d.
+    Cached on the module, so compiled code reads constants after the first call.
     """
+    spec = getattr(attn_module, _SP_SPEC_ATTR, None)
+    if spec is None:
+        spec = _resolve_sp_mode(attn_module)
+    return spec
+
+
+@torch.compiler.disable
+def _resolve_sp_mode(attn_module):
     backend = getattr(attn_module, "attn", None)
     ulysses_pg = None
     if type(backend).__name__ == "UlyssesAttention":
@@ -405,13 +418,18 @@ def sp_mode(attn_module):
         backend = backend.inner_backend
     name = type(backend).__name__
     if name in _UNSUPPORTED_SP:
-        return "unsupported", None
-    if name == "Attention2DAttention":
+        spec = ("unsupported", None)
+    elif name == "Attention2DAttention":
         row_pg, col_pg = backend.row_process_group, backend.col_process_group
-        return "attn2d", (ulysses_pg, row_pg, col_pg, _amax_groups(ulysses_pg, row_pg, col_pg))
-    if ulysses_pg is None:
-        return "none", None
-    return "ulysses", ulysses_pg
+        amax = ",".join(g.group_name for g in _amax_groups(ulysses_pg, row_pg, col_pg))
+        uly = ulysses_pg.group_name if ulysses_pg is not None else ""
+        spec = ("attn2d", (uly, row_pg.group_name, col_pg.group_name, amax))
+    elif ulysses_pg is None:
+        spec = ("none", None)
+    else:
+        spec = ("ulysses", ulysses_pg)
+    setattr(attn_module, _SP_SPEC_ATTR, spec)
+    return spec
 
 
 def fp8_self_attention_ulysses(qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps, interleave, pg):
@@ -517,6 +535,44 @@ def fp8_self_attention_attn2d(
     return out.reshape(batch, seq_local, num_heads * HEAD_DIM)
 
 
+@torch.library.custom_op("wanfused::fp8_self_attention_attn2d", mutates_args=())
+def fp8_self_attention_attn2d_op(
+    qkv: torch.Tensor,
+    norm_q_w: torch.Tensor,
+    norm_k_w: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    num_heads: int,
+    eps: float,
+    interleave: bool,
+    ulysses_group: str,
+    row_group: str,
+    col_group: str,
+    amax_groups: str,
+) -> torch.Tensor:
+    """fp8_self_attention_attn2d with groups by name; amax groups comma-joined, opaque to dynamo."""
+    return fp8_self_attention_attn2d(
+        qkv,
+        norm_q_w,
+        norm_k_w,
+        cos,
+        sin,
+        num_heads,
+        eps,
+        interleave,
+        _resolve_process_group(ulysses_group) if ulysses_group else None,
+        _resolve_process_group(row_group),
+        _resolve_process_group(col_group),
+        tuple(_resolve_process_group(g) for g in amax_groups.split(",") if g),
+    )
+
+
+@fp8_self_attention_attn2d_op.register_fake
+def _(qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps, interleave, uly, row, col, amax):
+    batch, seq, _ = qkv.shape
+    return qkv.new_empty(batch, seq, num_heads * HEAD_DIM)
+
+
 def _attn2d_core(qkv8, scale_v, row_pg, col_pg):
     """Gathers, FMHA with stats and LSE reduce-scatter; [3, B, S, H, D] to [B, S, H, D]."""
     q8, k8, v8 = qkv8.unbind(0)
@@ -563,7 +619,7 @@ def ulysses_self_attention(qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps, in
 def fused_self_attention(mode, groups, qkv, *args):
     """Runs the fused path for a supported sp_mode() result."""
     if mode == "attn2d":
-        return fp8_self_attention_attn2d(qkv, *args, *groups)
+        return fp8_self_attention_attn2d_op(qkv, *args, *groups)
     if mode == "ulysses":
         return ulysses_self_attention(qkv, *args, groups)
     return fp8_self_attention(qkv, *args)

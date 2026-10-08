@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from torch import nn
 
 from tensorrt_llm._torch.visual_gen.attention_backend import parallel as parallel_backend
 from tensorrt_llm._torch.visual_gen.config import (
@@ -282,3 +283,34 @@ def _wan_attn2d_logic(rank, world_size, parallel):
 def test_wan_transformer_fused_attention_attn2d(parallel):
     world_size = math.prod(parallel.values())
     _run_distributed(world_size, _wan_attn2d_logic, parallel=parallel)
+
+
+def _wan_attn2d_compiled_logic(rank, world_size, parallel):
+    device = torch.device("cuda", rank)
+    single = _wan_forward(_wan_model(device, "CUDNN"), device, fused=True)
+    model = _wan_model(device, "CUDNN", **parallel)
+    # Per-block torch.compile, as VisualGenPipeline.torch_compile does.
+    model.blocks = nn.ModuleList(
+        torch.compile(block, mode="default", dynamic=None, fullgraph=False)
+        for block in model.blocks
+    )
+    torch._dynamo.reset()
+    out = _wan_forward(model, device, fused=True)
+    assert fused_ops.sp_mode(model.blocks[0].attn1)[0] == "attn2d"
+    assert _cosine(out, single) > 0.9999
+    # After the first call the SP spec is cached: no further graph breaks.
+    breaks = sum(torch._dynamo.utils.counters["graph_break"].values())
+    again = _wan_forward(model, device, fused=True)
+    assert sum(torch._dynamo.utils.counters["graph_break"].values()) == breaks
+    assert torch.equal(again, out)
+
+
+@_needs_combine
+@pytest.mark.parametrize(
+    "parallel",
+    [_ATTN2D_PARALLEL[0], _ATTN2D_PARALLEL[2]],
+    ids=[_ATTN2D_IDS[0], _ATTN2D_IDS[2]],
+)
+def test_wan_transformer_fused_attention_attn2d_compiled(parallel):
+    world_size = math.prod(parallel.values())
+    _run_distributed(world_size, _wan_attn2d_compiled_logic, parallel=parallel)
