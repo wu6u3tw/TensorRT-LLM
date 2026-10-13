@@ -234,6 +234,7 @@ def _wan_model(device, backend, **parallel):
         ),
         visual_gen_mapping=vgm,
         skip_create_weights_in_init=False,
+        extra_attrs={"fused_fp8": "auto"},
     )
     config.mapping = vgm.to_llm_mapping()
     torch.manual_seed(42)
@@ -243,7 +244,7 @@ def _wan_model(device, backend, **parallel):
         for param in model.parameters():
             bound = 0.02 / max(1.0, param.shape[1] ** 0.5) if param.ndim >= 2 else 0.01
             param.uniform_(-bound, bound)
-    # cuDNN FP8 attention on Rubin turns the fused path on by default.
+    # fused_fp8=auto with cuDNN FP8 attention on Rubin turns fused attention on.
     assert all(block.attn1.allow_wan_fused_fp8 for block in model.blocks)
     return model
 

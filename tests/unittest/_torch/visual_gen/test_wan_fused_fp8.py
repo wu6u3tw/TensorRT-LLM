@@ -8,8 +8,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.wan import fused_fp8_route
+from tensorrt_llm._torch.visual_gen.models.wan.fused_fp8_route import FusedFp8Route
 from tensorrt_llm._torch.visual_gen.modules.wan_fused_fp8 import ops  # noqa: F401  (registers ops)
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or get_sm_version() != 107,
@@ -138,3 +144,37 @@ def test_fp8_self_attention_fp8_out_matches_bf16_out_then_quant():
     steps = (out8.view(torch.uint8).int() - ref8.view(torch.uint8).int()).abs()
     assert steps.max().item() <= 1
     assert (steps == 0).float().mean().item() > 0.95
+
+
+def _route_config(fused_fp8, fp8_attention=True, fp8_checkpoint=True):
+    quant_attn = QuantAttentionConfig(qk_dtype="fp8", v_dtype="fp8") if fp8_attention else None
+    return DiffusionModelConfig(
+        attention=AttentionConfig(backend="CUDNN", quant_attention_config=quant_attn),
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8 if fp8_checkpoint else None),
+        extra_attrs={} if fused_fp8 is None else {"fused_fp8": fused_fp8},
+    )
+
+
+@pytest.mark.parametrize("fused_fp8", [None, "off"], ids=["unset", "off"])
+def test_fused_fp8_route_off(fused_fp8):
+    assert fused_fp8_route.route(_route_config(fused_fp8), tp_size=1) == FusedFp8Route()
+
+
+def test_fused_fp8_route_auto_falls_back_per_path():
+    route = fused_fp8_route.route
+    assert route(_route_config("auto"), tp_size=1) == FusedFp8Route(block=True, attention=True)
+    # A BF16 checkpoint keeps fused attention; cuDNN BF16 attention keeps the fused block.
+    assert route(_route_config("auto", fp8_checkpoint=False), tp_size=1) == FusedFp8Route(
+        block=False, attention=True
+    )
+    assert route(_route_config("auto", fp8_attention=False), tp_size=1) == FusedFp8Route(
+        block=True, attention=False
+    )
+    assert route(_route_config("auto"), tp_size=2) == FusedFp8Route()
+
+
+def test_fused_fp8_route_require_raises_with_reason():
+    with pytest.raises(ValueError, match="attention is not cuDNN"):
+        fused_fp8_route.route(_route_config("require", fp8_attention=False), tp_size=1)
+    with pytest.raises(ValueError, match="expected one of"):
+        fused_fp8_route.route(_route_config("on"), tp_size=1)

@@ -65,8 +65,8 @@ _X264_PRESETS = (
 
 
 def _x264_preset() -> str:
-    """libx264 preset; ``TRTLLM_VIDEO_ENCODING_X264_PRESET`` overrides the medium default."""
-    preset = os.environ.get("TRTLLM_VIDEO_ENCODING_X264_PRESET", "medium").strip().lower()
+    """libx264 preset; ``TRTLLM_VIDEO_ENCODING_X264_PRESET`` overrides the ultrafast default."""
+    preset = os.environ.get("TRTLLM_VIDEO_ENCODING_X264_PRESET", "ultrafast").strip().lower()
     if preset not in _X264_PRESETS:
         raise ValueError(
             f"TRTLLM_VIDEO_ENCODING_X264_PRESET={preset!r} is not a libx264 preset; "
