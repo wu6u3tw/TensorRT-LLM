@@ -1,20 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Fused WanBlock forward for static-FP8 blocks on Rubin (TRTLLM_WAN_FUSED_BLOCK=1).
+"""Fused WanBlock forward for static-FP8 blocks on Rubin (SM107).
 
 Same math as WanBlock.forward; GEMM epilogues and row kernels fuse the element-wise work.
 """
-
-import os
 
 import torch
 
 from tensorrt_llm._utils import get_sm_version
 
 from ...modules.wan_fused_fp8 import ops as fused_ops
-
-# Attention writes FP8 for to_out, skipping the quant; "0" disables.
-_FP8_ATTN_OUT = os.environ.get("TRTLLM_WAN_FUSED_FP8_ATTN_OUT", "1") == "1"
 
 
 def _static_fp8(linear) -> bool:
@@ -119,7 +114,8 @@ def forward(block, x, encoder_hidden_states, temb, freqs_cos, freqs_sin, timeste
         x2d, None, None, None, 2, scale_msa, shift_msa, seq, eps, _inv_scale(attn1.qkv_proj)
     )
     qkv = _gemm(x8, attn1.qkv_proj, epilogue=1).view(batch, seq, -1)
-    if _FP8_ATTN_OUT and _fused_attn_mode(attn1)[0] == "none":
+    if _fused_attn_mode(attn1)[0] == "none":
+        # Fused attention writes FP8 for to_out, skipping a separate quant.
         attn_out8 = torch.ops.wanfused.fp8_self_attention_fp8_out(
             qkv, *_attn_args(attn1, freqs_cos, freqs_sin), attn1.to_out[0].input_scale
         )

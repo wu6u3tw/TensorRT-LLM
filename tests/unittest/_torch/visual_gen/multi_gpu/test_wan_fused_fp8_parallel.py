@@ -26,6 +26,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransfo
 from tensorrt_llm._torch.visual_gen.modules.wan_fused_fp8 import ops as fused_ops
 from tensorrt_llm._torch.visual_gen.modules.wan_fused_fp8 import ulysses_overlap
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ._visual_gen_dist_utils import spawn_with_retry
 
@@ -34,7 +35,6 @@ pytestmark = pytest.mark.skipif(
     reason="Wan fused FP8 kernels target Rubin (SM107).",
 )
 
-_FUSED_ENV = "TRTLLM_WAN_FUSED_FP8_ATTN"
 _HEAD_DIM = 128
 _WAN_CONFIG = dict(
     num_attention_heads=8,
@@ -228,7 +228,10 @@ def _wan_model(device, backend, **parallel):
     config = DiffusionModelConfig(
         pretrained_config=SimpleNamespace(**_WAN_CONFIG),
         torch_compile=TorchCompileConfig(enable=False),
-        attention=AttentionConfig(backend=backend),
+        attention=AttentionConfig(
+            backend=backend,
+            quant_attention_config=QuantAttentionConfig(qk_dtype="fp8", v_dtype="fp8"),
+        ),
         visual_gen_mapping=vgm,
         skip_create_weights_in_init=False,
     )
@@ -240,11 +243,15 @@ def _wan_model(device, backend, **parallel):
         for param in model.parameters():
             bound = 0.02 / max(1.0, param.shape[1] ** 0.5) if param.ndim >= 2 else 0.01
             param.uniform_(-bound, bound)
+    # cuDNN FP8 attention on Rubin turns the fused path on by default.
+    assert all(block.attn1.allow_wan_fused_fp8 for block in model.blocks)
     return model
 
 
 def _wan_forward(model, device, fused):
-    os.environ[_FUSED_ENV] = "1" if fused else "0"
+    # fused=False forces the module backend.
+    for block in model.blocks:
+        block.attn1.allow_wan_fused_fp8 = fused
     torch.manual_seed(100)
     latents = torch.randn(_LATENT_SHAPE, device=device, dtype=torch.bfloat16) * 0.1
     text = (

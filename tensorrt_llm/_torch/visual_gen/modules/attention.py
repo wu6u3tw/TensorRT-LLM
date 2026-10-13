@@ -13,14 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from enum import Enum
 from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig, SolAttentionConfig
 
@@ -711,11 +709,9 @@ class Attention(nn.Module):
             return out.flatten(2)
 
     def _use_wan_fused_fp8_attn(self) -> bool:
-        """Opt-in Wan fused FP8 self-attention (TRTLLM_WAN_FUSED_FP8_ATTN=1)."""
+        """Wan fused FP8 self-attention; WanBlock sets allow_wan_fused_fp8 on Rubin."""
         return (
             self.allow_wan_fused_fp8
-            and os.environ.get("TRTLLM_WAN_FUSED_FP8_ATTN", "0") == "1"
-            and get_sm_version() == 107
             and self.head_dim == 128
             and self.local_num_attention_heads <= 64
             and self.local_num_attention_heads == self.local_num_key_value_heads
@@ -749,7 +745,12 @@ class Attention(nn.Module):
         ):
             qkv = self.qkv_proj(hidden_states)
             freqs_cos, freqs_sin = freqs
-            if seq_len == kv_seq_len and not kwargs and self._use_wan_fused_fp8_attn():
+            if (
+                seq_len == kv_seq_len
+                and not kwargs
+                and qkv.dtype == torch.bfloat16
+                and self._use_wan_fused_fp8_attn()
+            ):
                 out = wan_fused_fp8_ops.self_attention(self, qkv, freqs_cos, freqs_sin, timestep)
                 return self.to_out[0](out)
             self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)

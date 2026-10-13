@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import math
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -40,8 +39,10 @@ from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
 )
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
+from tensorrt_llm._torch.visual_gen.modules.wan_fused_fp8 import _ext as wan_fused_fp8_ext
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -285,10 +286,6 @@ def _default_vsa_gate(linear: Linear, bias_value: float) -> None:
             linear.bias.fill_(bias_value)
 
 
-# Read once so the compiled block forward has no env lookups.
-_FUSED_BLOCK = os.environ.get("TRTLLM_WAN_FUSED_BLOCK", "0") == "1"
-
-
 class WanBlock(nn.Module):
     def __init__(
         self,
@@ -360,9 +357,20 @@ class WanBlock(nn.Module):
             separate_qkv_is_self_attention=True,
             module_name=f"blocks.{_layer_idx}.attn1",
         )
-        # Opt-in fused FP8 self-attention: TP=1 and dense attention only.
+        # Rubin fused kernels: the block fusion keeps the static-FP8 math; the fused
+        # self-attention replaces cuDNN per-tensor FP8 attention, so it needs that config.
+        attention_config = model_config.attention
+        quant_attn = attention_config.quant_attention_config
+        on_rubin = get_sm_version() == 107 and tp_size == 1 and wan_fused_fp8_ext.jit_available()
+        self._use_fused_block = on_rubin
         self.attn1.allow_wan_fused_fp8 = (
-            tp_size == 1 and model_config.attention.sparse_attention_config is None
+            on_rubin
+            and wan_fused_fp8_ext.fmha_available()
+            and attention_config.backend == "CUDNN"
+            and attention_config.sparse_attention_config is None
+            and quant_attn is not None
+            and quant_attn.qk_dtype == "fp8"
+            and quant_attn.v_dtype == "fp8"
         )
 
         # Cross-attention with separate Q, K, V
@@ -559,7 +567,7 @@ class WanBlock(nn.Module):
         freqs_sin,
         timestep=None,
     ):
-        if _FUSED_BLOCK and fused_block.eligible(self, x, temb):
+        if self._use_fused_block and fused_block.eligible(self, x, temb):
             return fused_block.forward(
                 self, x, encoder_hidden_states, temb, freqs_cos, freqs_sin, timestep
             )

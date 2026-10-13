@@ -38,13 +38,10 @@ cublasLtHandle_t ltHandle()
 }
 
 // FFN-up: heuristic nvjet config with a 2x4 cluster, bit-identical and faster.
-// TRTLLM_WAN_GEMM_FFNUP_PIN=0 keeps the heuristic top.
+// Returns false (caller keeps the heuristic top) when the config is not valid here.
 bool pinnedFfnUpAlgo(cublasLtMatmulDesc_t op, cublasLtMatrixLayout_t lA, cublasLtMatrixLayout_t lB,
     cublasLtMatrixLayout_t lC, cublasLtMatrixLayout_t lD, size_t wsBytes, cublasLtMatmulAlgo_t* algo)
 {
-    char const* env = std::getenv("TRTLLM_WAN_GEMM_FFNUP_PIN");
-    if (env != nullptr && std::atoi(env) == 0)
-        return false;
     cublasLtMatmulAlgo_t a;
     if (cublasLtMatmulAlgoInit(ltHandle(), CUBLAS_COMPUTE_32F, CUDA_R_32F, CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, CUDA_R_16BF,
             CUDA_R_8F_E4M3, 66, &a)
