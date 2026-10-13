@@ -6,7 +6,6 @@ Q/K scales fold the softmax scale, so attention runs with scaleSoftmaxLog2 == 1.
 """
 
 import math
-import socket
 from typing import List, Optional
 
 import torch
@@ -23,26 +22,6 @@ from ._common import FP8, FP8_MAX, HEAD_DIM, rope_tables, shape_buffers
 _UNSUPPORTED_SP = ("RingAttention",)
 # Head groups per rank for the overlapped Ulysses path.
 _ULYSSES_GROUPS = 2
-_single_node_groups = {}
-
-
-@torch.compiler.disable
-def _single_node(pg) -> bool:
-    """Whether all ranks of pg share this node, as the peer-mapped overlap buffers need."""
-    if pg.group_name not in _single_node_groups:
-        hosts = [None] * dist.get_world_size(group=pg)
-        dist.all_gather_object(hosts, socket.gethostname(), group=pg)
-        _single_node_groups[pg.group_name] = len(set(hosts)) == 1
-    return _single_node_groups[pg.group_name]
-
-
-def _use_ulysses_overlap(num_heads, pg) -> bool:
-    # Host-side flag epochs do not advance on CUDA graph replay, so capture uses all-to-all.
-    return (
-        not torch.cuda.is_current_stream_capturing()
-        and ulysses_overlap.supported(num_heads, dist.get_world_size(group=pg), _ULYSSES_GROUPS)
-        and _single_node(pg)
-    )
 
 
 def _norm_rope_quant(
@@ -614,8 +593,8 @@ def _attn2d_core(qkv8, scale_v, row_pg, col_pg):
 
 
 def ulysses_self_attention(qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps, interleave, pg):
-    """Ulysses fused attention, overlapped with FMHA when the group allows it."""
-    if _use_ulysses_overlap(num_heads, pg):
+    """Ulysses fused attention; the overlap op itself falls back when it cannot overlap."""
+    if ulysses_overlap.supported(num_heads, dist.get_world_size(group=pg), _ULYSSES_GROUPS):
         return ulysses_overlap.fp8_self_attention_ulysses_overlap(
             qkv,
             norm_q_w,

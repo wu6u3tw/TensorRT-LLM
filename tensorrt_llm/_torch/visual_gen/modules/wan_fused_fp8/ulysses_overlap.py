@@ -8,8 +8,11 @@ Same kernels and scales as ops.fp8_self_attention_ulysses; only data movement di
 - Ready flags use stream memops, so no SMs spin.
 - Local heads split into groups: copies of one group overlap FMHA of another.
 
-Every rank must see all GPUs of its Ulysses group (one node).
+Peer-mapped buffers need the whole Ulysses group on one node, and the host-side flag
+epoch does not advance on CUDA graph replay; otherwise the op runs the all-to-all path.
 """
+
+import socket
 
 import torch
 import torch.distributed as dist
@@ -23,6 +26,7 @@ _FLAG_BYTES = 4096
 
 _states = {}
 _side_streams = {}
+_single_node_groups = {}
 
 
 class _State:
@@ -71,6 +75,15 @@ def supported(num_heads: int, world: int, groups: int) -> bool:
     return num_heads % (world * groups) == 0
 
 
+def _single_node(pg, group_name: str) -> bool:
+    """Whether all ranks of pg share this node; gathered once per group."""
+    if group_name not in _single_node_groups:
+        hosts = [None] * dist.get_world_size(pg)
+        dist.all_gather_object(hosts, socket.gethostname(), group=pg)
+        _single_node_groups[group_name] = len(set(hosts)) == 1
+    return _single_node_groups[group_name]
+
+
 @torch.library.custom_op("wanfused::fp8_self_attention_ulysses_overlap", mutates_args=())
 def fp8_self_attention_ulysses_overlap(
     qkv: torch.Tensor,
@@ -85,8 +98,15 @@ def fp8_self_attention_ulysses_overlap(
     groups: int,
 ) -> torch.Tensor:
     """Local [B, S/P, 3*H*D] to [B, S/P, H*D], all-to-all overlapped with FMHA."""
-    peer = _ext.peer()
     pg = _resolve_process_group(group_name)
+    # Checked here, at run time, so torch.compile tracing cannot fix the choice.
+    if torch.cuda.is_current_stream_capturing() or not _single_node(pg, group_name):
+        from .ops import fp8_self_attention_ulysses
+
+        return fp8_self_attention_ulysses(
+            qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps, interleave, pg
+        ).contiguous()
+    peer = _ext.peer()
     world, me = dist.get_world_size(pg), dist.get_rank(pg)
     batch, seq_local, _ = qkv.shape
     heads, seq = num_heads, seq_local * world

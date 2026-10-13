@@ -139,6 +139,28 @@ def _ulysses_overlap_logic(rank, world_size, batch, seq, heads, groups):
         torch.cuda.synchronize()
         # Same kernels and scales; only data movement differs.
         assert torch.equal(out, expected)
+    # The group is on one node, so the calls above overlapped.
+    assert ulysses_overlap._single_node_groups[pg.group_name]
+
+    # CUDA graph capture takes the all-to-all path, which replays correctly.
+    overlap_args = (*args, pg.group_name, groups)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        ulysses_overlap.fp8_self_attention_ulysses_overlap(*overlap_args)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = ulysses_overlap.fp8_self_attention_ulysses_overlap(*overlap_args)
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured, expected)
+
+    # A group spanning nodes takes the all-to-all path.
+    ulysses_overlap._single_node_groups[pg.group_name] = False
+    out = ulysses_overlap.fp8_self_attention_ulysses_overlap(*overlap_args)
+    assert torch.equal(out, expected)
 
 
 @pytest.mark.parametrize("batch", [1, 2])
